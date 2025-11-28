@@ -17,7 +17,8 @@ WITH PillarPageConfig AS (
     STRUCT('/pages/what-is-an-ebike' AS url_contains, 'what-is-an-ebike' AS new_source, 'pillar page' AS new_medium),
     STRUCT('/pages/cruiser-ebike' AS url_contains, 'cruiser-ebike' AS new_source, 'pillar page' AS new_medium),
     STRUCT('/pages/folding-ebike' AS url_contains, 'folding-ebike' AS new_source, 'pillar page' AS new_medium),
-    STRUCT('/pages/city-ebike' AS url_contains, 'city-ebike' AS new_source, 'pillar page' AS new_medium)
+    STRUCT('/pages/city-ebike' AS url_contains, 'city-ebike' AS new_source, 'pillar page' AS new_medium),
+    STRUCT('/pages/fat-tire-ebike' AS url_contains, 'fat-tire-ebike' AS new_source, 'pillar page' AS new_medium)
   ])
 ),
 
