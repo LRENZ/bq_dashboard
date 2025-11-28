@@ -1,0 +1,334 @@
+
+config {
+    type: "table",
+    schema: "attribution",
+    description: "Optimized attribution table. Fixes Unassigned/Direct issues by parsing URL parameters (gclid/fbclid) and applying Last Non-Direct attribution logic.",
+}
+
+-- 1. Pillar Page 归因规则配置 (保持不变)
+WITH PillarPageConfig AS (
+    SELECT * FROM UNNEST([
+        STRUCT('/pages/what-is-an-ebike' AS url_contains, 'what-is-an-ebike' AS new_source, 'pillar page' AS new_medium),
+        STRUCT('/pages/cruiser-ebike' AS url_contains, 'cruiser-ebike' AS new_source, 'pillar page' AS new_medium),
+        STRUCT('/pages/folding-ebike' AS url_contains, 'folding-ebike' AS new_source, 'pillar page' AS new_medium),
+        STRUCT('/pages/city-ebike' AS url_contains, 'city-ebike' AS new_source, 'pillar page' AS new_medium)
+    ])
+),
+
+-- 2. 事件层数据提取 (保持不变)
+SessionEvents AS (
+  WITH RawEvents AS (
+    SELECT
+      *,
+      (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location') AS page_location
+    FROM
+      ${ref('analytics_489554557', 'events_*')}
+    WHERE
+      event_name IN ('purchase', 'session_start', 'first_visit', 'page_view') 
+      AND NOT(ecommerce.transaction_id IS NOT NULL AND ecommerce.purchase_revenue_in_usd = 0)
+  )
+  SELECT
+    COALESCE(LAST_VALUE(raw.user_id IGNORE NULLS) OVER (PARTITION BY raw.user_pseudo_id ORDER BY raw.event_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), raw.user_pseudo_id) AS unified_user_id,
+    raw.event_timestamp,
+    raw.event_name,
+    raw.session_traffic_source_last_click.cross_channel_campaign.source AS session_source,
+    raw.session_traffic_source_last_click.cross_channel_campaign.medium AS session_medium,
+    raw.session_traffic_source_last_click.cross_channel_campaign.campaign_name AS session_campaign,
+    COALESCE(
+      ppc.new_source,
+      raw.collected_traffic_source.manual_source
+    ) AS event_source,
+    COALESCE(
+      ppc.new_medium,
+      raw.collected_traffic_source.manual_medium
+    ) AS event_medium,
+    raw.collected_traffic_source.manual_campaign_name AS event_campaign,
+    raw.page_location,
+    raw.ecommerce.transaction_id,
+    raw.ecommerce.purchase_revenue_in_usd AS transaction_value,
+    
+    raw.geo.country AS country,
+    raw.geo.region AS region,
+    CASE WHEN raw.page_location LIKE '%/find-a-dealer%' THEN 1 ELSE 0 END AS is_hit_on_dealer_page
+
+  FROM
+    RawEvents AS raw
+  LEFT JOIN
+    PillarPageConfig AS ppc
+    ON raw.event_name = 'page_view' AND raw.page_location LIKE CONCAT('%', ppc.url_contains, '%')
+),
+
+-- 3. Source/Medium/Campaign 回退 (修复：添加 page_location 输出)
+SourceMediumFallback AS (
+  SELECT
+    unified_user_id,
+    event_timestamp,
+    event_name,
+    -- 【修复点】必须输出 page_location，否则下一步无法使用
+    page_location, 
+    
+    -- Source 解析
+    COALESCE(
+        IF(event_medium = 'pillar page', event_source, NULL),
+        CASE 
+          WHEN REGEXP_CONTAINS(page_location, r'[?&]gclid=') THEN 'google'
+          WHEN REGEXP_CONTAINS(page_location, r'[?&]fbclid=') THEN 'facebook'
+          WHEN REGEXP_CONTAINS(page_location, r'[?&]msclkid=') THEN 'bing'
+          ELSE NULL 
+        END,
+        REGEXP_EXTRACT(page_location, r'[?&]utm_source=([^&]+)'),
+        NULLIF(NULLIF(NULLIF(session_source, '(not set)'), '(direct)'), 'direct'),
+        NULLIF(NULLIF(NULLIF(event_source, '(not set)'), '(direct)'), 'direct'),
+        'direct'
+    ) AS source,
+    
+    -- Medium 解析
+    COALESCE(
+        IF(event_medium = 'pillar page', 'pillar page', NULL),
+        CASE 
+          WHEN REGEXP_CONTAINS(page_location, r'[?&]gclid=') THEN 'cpc'
+          WHEN REGEXP_CONTAINS(page_location, r'[?&]fbclid=') THEN 'paidsocial'
+          WHEN REGEXP_CONTAINS(page_location, r'[?&]msclkid=') THEN 'cpc'
+          ELSE NULL 
+        END,
+        REGEXP_EXTRACT(page_location, r'[?&]utm_medium=([^&]+)'),
+        NULLIF(NULLIF(NULLIF(session_medium, '(not set)'), '(none)'), 'none'),
+        NULLIF(NULLIF(NULLIF(event_medium, '(not set)'), '(none)'), 'none'),
+        'none'
+    ) AS medium,
+    
+    -- Campaign 解析
+    COALESCE(
+        REGEXP_EXTRACT(page_location, r'[?&]utm_campaign=([^&]+)'),
+        NULLIF(session_campaign, '(not set)'),
+        NULLIF(event_campaign, '(not set)')
+    ) AS campaign,
+    
+    transaction_id,
+    transaction_value,
+    country,
+    region,
+    is_hit_on_dealer_page
+  FROM
+    SessionEvents
+),
+
+-- 4a. RawTouchpoints
+RawTouchpoints AS (
+  SELECT
+    unified_user_id,
+    event_timestamp,
+    event_name,
+    CASE
+        -- 规则 0
+        WHEN medium = 'pillar page' THEN 'Pillar Page'
+
+        -- 规则 1
+        WHEN REGEXP_CONTAINS(LOWER(medium), r'affiliate|avantlink|uppromote|goaffpro|impact') OR REGEXP_CONTAINS(LOWER(source), r'affiliate|avantlink|uppromote|goaffpro|impact') THEN 'Affiliates' 
+        -- 规则 2
+        WHEN REGEXP_CONTAINS(LOWER(medium), r'sms') THEN 'SMS'
+        -- 规则 3
+        WHEN REGEXP_CONTAINS(LOWER(source), r'klaviyo|email|substack|wunderkind') OR LOWER(medium) = 'edm' THEN 'Email'
+        -- 规则 4
+        WHEN REGEXP_CONTAINS(LOWER(medium), r'kol') OR LOWER(source) = 'kol' THEN 'KOL'
+        -- 规则 5
+        WHEN LOWER(medium) = 'programmatic' OR REGEXP_CONTAINS(LOWER(source), r'ttd|outbrain|loopme|criteo|tradedesk') THEN 'Programmatic Ads'
+
+        -- 规则 6 Paid Brand
+        WHEN (LOWER(medium) IN ('cpc','ppc','paidsearch') OR REGEXP_CONTAINS(LOWER(source), r'^(google|bing)$')) AND REGEXP_CONTAINS(LOWER(campaign), r'brand') THEN 'Paid Brand Search'
+
+        -- 规则 7 Paid Non-Brand
+        WHEN (LOWER(medium) IN ('cpc','ppc','paidsearch') OR REGEXP_CONTAINS(LOWER(source), r'^(google|bing)$')) AND (NOT REGEXP_CONTAINS(LOWER(campaign), r'brand') OR campaign IS NULL) THEN 'Paid Non-Brand Search'
+
+        -- 规则 8
+        WHEN LOWER(medium) = 'organic' THEN 'Organic Search'
+
+        -- 规则 9 Paid Social
+        WHEN (REGEXP_CONTAINS(LOWER(source), r'facebook|twitter|youtube|instagram|reddit|fb|quora') OR LOWER(medium) = 'paidsocial') AND LOWER(medium) != 'referral' THEN 'Paid Social'
+
+        -- 规则 10 Organic Social
+        WHEN LOWER(medium) IN ('social', 'social-network', 'social-media') OR REGEXP_CONTAINS(LOWER(source), r'facebook|twitter|instagram|linkedin|pinterest|tiktok|youtube|t.co|reddit') THEN 'Organic Social'
+
+        -- 规则 11-14
+        WHEN LOWER(medium) = 'paidvideo' THEN 'Paid Video'
+        WHEN LOWER(medium) = 'organic video' THEN 'Organic Video'
+        WHEN LOWER(medium) = 'shopping' OR REGEXP_CONTAINS(LOWER(campaign), r'shopping') THEN 'Paid Shopping'
+        WHEN LOWER(source) IN ('google shopping', 'shopping.google.com') THEN 'Organic Shopping'
+        
+        -- 规则 15-18
+        WHEN LOWER(medium) IN ('display', 'cpm', 'banner', 'paiddisplay') THEN 'Paid Display'
+        WHEN LOWER(source) = 'google' AND LOWER(medium) = 'cross-network' THEN 'Cross-network'
+        WHEN LOWER(medium) = 'audio' THEN 'Audio'
+        WHEN LOWER(source) = '(not set)' AND LOWER(medium) = 'push' THEN 'Mobile Push Notifications'
+
+        -- 规则 19
+        WHEN REGEXP_CONTAINS(LOWER(medium), r'paid') THEN 'Paid Other'
+
+        -- 规则 20-21
+        WHEN LOWER(medium) IN ('ads', 'pr', 'paidreferral') OR REGEXP_CONTAINS(LOWER(source), r'capitaloneshopping') THEN 'Paid Referral'
+        WHEN LOWER(medium) = 'referral' OR REGEXP_CONTAINS(LOWER(source), r'chatgpt') OR LOWER(medium) = 'earnedreferral' THEN 'Organic Referral'
+        
+        -- 规则 22
+        WHEN source = 'direct' OR medium IN ('(none)', 'none') THEN 'Direct'
+        
+        -- 规则 23
+        WHEN REGEXP_CONTAINS(LOWER(medium), r'tv|television|connectedtv') OR REGEXP_CONTAINS(LOWER(source), r'mntn') THEN 'Connected TV'
+        
+        -- 规则 24: 通用付费兜底
+        WHEN LOWER(medium) IN ('cpc', 'ppc', 'paid') THEN 'Paid Other'
+        
+        -- 规则 25
+        ELSE 'Unassigned'
+    END AS raw_channel,
+    
+    CASE 
+        WHEN LOWER(medium) LIKE '%cpc%' 
+          OR LOWER(medium) LIKE '%paid%' 
+          OR LOWER(medium) IN ('ppc', 'display', 'cpm', 'banner', 'video', 'shopping')
+          OR REGEXP_CONTAINS(LOWER(source), r'capitaloneshopping')
+          OR REGEXP_CONTAINS(page_location, r'[?&]gclid=') -- 这里用到了 page_location
+        THEN TRUE
+        ELSE FALSE
+    END AS is_paid_traffic,
+    transaction_id,
+    transaction_value,
+    country,
+    region,
+    is_hit_on_dealer_page
+  FROM
+    SourceMediumFallback
+),
+
+-- 4b. AllTouchpoints (末次非直达修复)
+AllTouchpoints AS (
+  SELECT
+    *,
+    COALESCE(
+      LAST_VALUE(
+        IF(LOWER(raw_channel) NOT IN ('direct', 'unassigned', '(not set)', 'none', 'unknown'), raw_channel, NULL)
+        IGNORE NULLS
+      ) OVER (
+        PARTITION BY unified_user_id 
+        ORDER BY event_timestamp 
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      ),
+      raw_channel
+    ) AS channel
+  FROM
+    RawTouchpoints
+),
+
+-- 5. PurchaseEvents (保持不变)
+PurchaseEvents AS (
+  SELECT
+    unified_user_id,
+    transaction_id,
+    event_timestamp AS purchase_timestamp,
+    transaction_value,
+    DATE(TIMESTAMP_MICROS(event_timestamp), "America/Los_Angeles") AS purchase_date,
+    LAG(event_timestamp, 1, 0) OVER (PARTITION BY unified_user_id ORDER BY event_timestamp) AS previous_purchase_timestamp
+  FROM
+    AllTouchpoints
+  WHERE
+    transaction_id IS NOT NULL 
+    AND transaction_value > 0
+    AND DATE(TIMESTAMP_MICROS(event_timestamp), "America/Los_Angeles") >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 30 DAY)
+),
+
+-- 6. TransactionJourneys (保持不变)
+TransactionJourneys AS (
+  SELECT
+    p.unified_user_id,
+    p.transaction_id,
+    p.purchase_date,
+    p.transaction_value,
+    ARRAY_AGG(
+      STRUCT(
+        t.channel,
+        t.event_name,
+        t.event_timestamp,
+        t.is_paid_traffic,
+        t.country,
+        t.region,
+        t.is_hit_on_dealer_page
+      ) 
+      ORDER BY t.event_timestamp
+    ) AS touchpoint_path
+  FROM
+    PurchaseEvents AS p
+  JOIN
+    AllTouchpoints AS t
+    ON p.unified_user_id = t.unified_user_id
+  WHERE
+    t.event_timestamp > p.previous_purchase_timestamp AND t.event_timestamp <= p.purchase_timestamp
+  GROUP BY
+    p.unified_user_id,
+    p.transaction_id,
+    p.purchase_date,
+    p.transaction_value
+),
+
+-- 7. ExpandedPath (保持不变)
+ExpandedPath AS (
+  SELECT
+    t.unified_user_id,
+    TIMESTAMP_MICROS(touchpoint.event_timestamp) AS event_timestamp_obj,
+    DATE(TIMESTAMP_MICROS(touchpoint.event_timestamp), "America/Los_Angeles") AS event_date_parsed,
+    touchpoint.event_name,
+    touchpoint.channel AS channel,
+    touchpoint.is_paid_traffic,
+    touchpoint.country,
+    touchpoint.region,
+    touchpoint.is_hit_on_dealer_page,
+    t.transaction_value,
+    t.purchase_date,
+    t.transaction_id
+  FROM
+    TransactionJourneys AS t
+  CROSS JOIN
+    UNNEST(t.touchpoint_path) AS touchpoint
+),
+
+-- 8. Final (保持不变)
+Final AS (
+  SELECT
+    unified_user_id,
+    event_date_parsed AS event_date,
+    channel,
+    is_paid_traffic,
+    country,
+    region,
+    MAX(is_hit_on_dealer_page) OVER (PARTITION BY unified_user_id, transaction_id) AS visited_find_dealer,
+    CASE WHEN event_name = 'purchase' THEN 1 ELSE 0 END AS total_transactions,
+    CASE WHEN event_name = 'purchase' THEN transaction_value ELSE 0 END AS total_transaction_value,
+    CASE WHEN event_name = 'purchase' THEN TRUE ELSE FALSE END AS has_transaction,
+    LAG(channel) OVER (PARTITION BY unified_user_id, transaction_id ORDER BY event_timestamp_obj) AS prev_channel,
+    event_name,
+    purchase_date,
+    transaction_id,
+    event_timestamp_obj
+  FROM
+    ExpandedPath
+)
+
+-- 最终输出
+SELECT
+  unified_user_id,
+  event_date,
+  country,
+  region,
+  visited_find_dealer,
+  channel,
+  is_paid_traffic,
+  total_transactions,
+  total_transaction_value,
+  event_timestamp_obj,
+  has_transaction
+FROM
+  Final
+WHERE
+  prev_channel IS NULL
+  OR channel != prev_channel
+  OR event_name = 'purchase'
+ORDER BY
+  purchase_date, unified_user_id, transaction_id, event_timestamp_obj

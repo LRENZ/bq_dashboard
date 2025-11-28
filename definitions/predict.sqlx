@@ -1,0 +1,57 @@
+config {
+  type: "table",
+  schema: "dataform_output",
+  description: "各渠道和地区的线下购买倾向度评分 (0-1)"
+}
+
+WITH Predictions AS (
+  SELECT
+    *
+  FROM
+    ML.PREDICT(
+      MODEL ${ref("offline_intent_model")},
+      (
+        SELECT
+          unified_user_id,
+          region,
+          last_touch_channel,
+          day_of_week,
+          month,
+          interaction_count,
+          interaction_date -- 保留日期用于聚合
+        FROM
+          ${ref("01_feature_engineering")}
+      )
+    )
+),
+
+ExtractedScores AS (
+  SELECT
+    region,
+    last_touch_channel AS channel,
+    interaction_date AS date,
+    -- ML.PREDICT 输出的 probability 是一个数组，我们需要提取 label=1 的概率
+    (SELECT prob FROM UNNEST(predicted_has_offline_intent_probs) WHERE label = 1) AS propensity_score
+  FROM
+    Predictions
+)
+
+SELECT
+  date,
+  region,
+  channel,
+  -- 核心指标：平均倾向度 (Propensity Score)
+  -- 越接近 1，代表该组用户去线下店的意愿越强
+  AVG(propensity_score) AS avg_offline_propensity,
+  
+  -- 辅助指标：该组有多少用户
+  COUNT(*) AS user_count,
+  
+  -- 辅助指标：模型预测会转化的数量 vs 实际潜在数量
+  SUM(CASE WHEN propensity_score > 0.5 THEN 1 ELSE 0 END) AS predicted_high_intent_users
+FROM
+  ExtractedScores
+GROUP BY
+  1, 2, 3
+ORDER BY
+  avg_offline_propensity DESC

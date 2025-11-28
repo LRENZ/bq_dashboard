@@ -1,0 +1,290 @@
+config {
+  type: "incremental",
+  schema: "attribution",
+  name: "composite_attribution_performance",
+  description: "Composite attribution - GUARANTEED daily totals match",
+  uniqueKey: ["date", "channel"],
+  bigquery: {
+    partitionBy: "date",
+    clusterBy: ["channel"]
+  },
+  tags: ["attribution", "composite", "mta"]
+}
+
+-- ============================================================================
+-- 强制保证每日总和一致的归因表
+-- MTA 总转化 = Last Click 总转化
+-- MTA 总收入 = Last Click 总收入
+-- ============================================================================
+
+WITH 
+-- 1. 获取原始流量表现
+Raw_Performance AS (
+  SELECT
+    date,
+    channel,
+    conversion AS last_click_conversions,
+    revenue AS last_click_revenue,
+    session AS sessions,
+    users
+  FROM
+    ${ref('channel_performance')}
+  WHERE
+    ${when(
+      incremental(),
+      `date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 7 DAY)`,
+      `date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 90 DAY)`
+    )}
+),
+
+-- 2. 计算每日总盘
+Daily_Totals AS (
+  SELECT
+    date,
+    SUM(last_click_conversions) AS total_daily_conversions,
+    SUM(last_click_revenue) AS total_daily_revenue
+  FROM
+    Raw_Performance
+  GROUP BY
+    date
+),
+
+-- 3. 获取 MTA 权重
+MTA_Weights AS (
+  SELECT
+    channel,
+    Weight AS mta_weight,
+    Original_Markov_Weight AS original_markov_weight,
+    Removal_Effect AS removal_effect,
+    Fallback_Weight AS fallback_weight,
+    Channel_Category AS channel_category,
+    Weight_Source AS weight_source
+  FROM
+    ${ref('mta_weights_complete')}
+),
+
+-- 4. 为每个渠道分配权重（缺失则为 0）
+Channel_With_Weights AS (
+  SELECT
+    rp.date,
+    rp.channel,
+    rp.last_click_conversions,
+    rp.last_click_revenue,
+    rp.sessions,
+    rp.users,
+    COALESCE(mw.mta_weight, 0) AS raw_weight,
+    COALESCE(mw.original_markov_weight, 0) AS original_markov_weight,
+    COALESCE(mw.removal_effect, 0) AS removal_effect,
+    COALESCE(mw.fallback_weight, 0) AS fallback_weight,
+    COALESCE(mw.channel_category, 'missing_weight') AS channel_category,
+    COALESCE(mw.weight_source, 'Missing Weight') AS weight_source
+  FROM
+    Raw_Performance rp
+  LEFT JOIN
+    MTA_Weights mw
+    ON rp.channel = mw.channel
+),
+
+-- 5. 计算每日权重总和
+Daily_Weight_Sums AS (
+  SELECT
+    date,
+    SUM(raw_weight) AS daily_weight_sum
+  FROM
+    Channel_With_Weights
+  GROUP BY
+    date
+),
+
+-- 6. 归一化权重（确保每日权重总和 = 1）
+Normalized_Weights AS (
+  SELECT
+    cw.date,
+    cw.channel,
+    cw.last_click_conversions,
+    cw.last_click_revenue,
+    cw.sessions,
+    cw.users,
+    cw.raw_weight,
+    cw.original_markov_weight,
+    cw.removal_effect,
+    cw.fallback_weight,
+    cw.channel_category,
+    cw.weight_source,
+    dws.daily_weight_sum,
+    
+    -- 归一化权重
+    CASE
+      WHEN dws.daily_weight_sum > 0 THEN
+        SAFE_DIVIDE(cw.raw_weight, dws.daily_weight_sum)
+      ELSE
+        -- 如果所有权重都是 0，平均分配
+        SAFE_DIVIDE(1.0, COUNT(*) OVER (PARTITION BY cw.date))
+    END AS normalized_weight
+  FROM
+    Channel_With_Weights cw
+  INNER JOIN
+    Daily_Weight_Sums dws
+    ON cw.date = dws.date
+),
+
+-- 7. 第一次计算 MTA（可能有小误差）
+Initial_MTA_Calculation AS (
+  SELECT
+    nw.date,
+    nw.channel,
+    nw.last_click_conversions,
+    nw.last_click_revenue,
+    nw.sessions,
+    nw.users,
+    nw.normalized_weight,
+    nw.original_markov_weight,
+    nw.removal_effect,
+    nw.fallback_weight,
+    nw.channel_category,
+    nw.weight_source,
+    nw.daily_weight_sum,
+    dt.total_daily_conversions,
+    dt.total_daily_revenue,
+    
+    -- 初步计算 MTA
+    dt.total_daily_conversions * nw.normalized_weight AS initial_mta_conversions,
+    dt.total_daily_revenue * nw.normalized_weight AS initial_mta_revenue
+  FROM
+    Normalized_Weights nw
+  INNER JOIN
+    Daily_Totals dt
+    ON nw.date = dt.date
+),
+
+-- 8. 计算初步 MTA 的总和
+Initial_MTA_Sums AS (
+  SELECT
+    date,
+    SUM(initial_mta_conversions) AS sum_initial_mta_conversions,
+    SUM(initial_mta_revenue) AS sum_initial_mta_revenue
+  FROM
+    Initial_MTA_Calculation
+  GROUP BY
+    date
+),
+
+-- 9. 强制归一化（确保总和完全一致）
+Final_MTA_Calculation AS (
+  SELECT
+    imc.date,
+    imc.channel,
+    imc.last_click_conversions,
+    imc.last_click_revenue,
+    imc.sessions,
+    imc.users,
+    imc.normalized_weight,
+    imc.original_markov_weight,
+    imc.removal_effect,
+    imc.fallback_weight,
+    imc.channel_category,
+    imc.weight_source,
+    imc.daily_weight_sum,
+    imc.total_daily_conversions,
+    imc.total_daily_revenue,
+    
+    -- 强制归一化 MTA 转化
+    CASE
+      WHEN ims.sum_initial_mta_conversions > 0 THEN
+        ROUND(
+          imc.total_daily_conversions * SAFE_DIVIDE(
+            imc.initial_mta_conversions,
+            ims.sum_initial_mta_conversions
+          ),
+          2
+        )
+      ELSE
+        -- 如果初步 MTA 总和为 0，平均分配
+        ROUND(
+          SAFE_DIVIDE(
+            imc.total_daily_conversions,
+            COUNT(*) OVER (PARTITION BY imc.date)
+          ),
+          2
+        )
+    END AS mta_conversions,
+    
+    -- 强制归一化 MTA 收入
+    CASE
+      WHEN ims.sum_initial_mta_revenue > 0 THEN
+        ROUND(
+          imc.total_daily_revenue * SAFE_DIVIDE(
+            imc.initial_mta_revenue,
+            ims.sum_initial_mta_revenue
+          ),
+          2
+        )
+      ELSE
+        -- 如果初步 MTA 总和为 0，平均分配
+        ROUND(
+          SAFE_DIVIDE(
+            imc.total_daily_revenue,
+            COUNT(*) OVER (PARTITION BY imc.date)
+          ),
+          2
+        )
+    END AS mta_revenue
+  FROM
+    Initial_MTA_Calculation imc
+  INNER JOIN
+    Initial_MTA_Sums ims
+    ON imc.date = ims.date
+)
+
+-- 10. 最终输出
+SELECT
+  date,
+  channel,
+  
+  -- ========== Last Click 指标 ==========
+  last_click_conversions,
+  last_click_revenue,
+  sessions,
+  users,
+  
+  -- ========== 多触点归因指标 ==========
+  mta_conversions,
+  mta_revenue,
+  
+  -- ========== 权重信息 ==========
+  normalized_weight AS attribution_weight,
+  original_markov_weight,
+  removal_effect,
+  fallback_weight,
+  channel_category,
+  weight_source,
+  
+  -- ========== 对比指标 ==========
+  (mta_conversions - last_click_conversions) AS conversion_difference,
+  SAFE_DIVIDE(
+    (mta_conversions - last_click_conversions),
+    NULLIF(last_click_conversions, 0)
+  ) AS conversion_uplift_rate,
+  
+  (mta_revenue - last_click_revenue) AS revenue_difference,
+  SAFE_DIVIDE(
+    (mta_revenue - last_click_revenue),
+    NULLIF(last_click_revenue, 0)
+  ) AS revenue_uplift_rate,
+  
+  -- ========== 效率指标 ==========
+  SAFE_DIVIDE(last_click_conversions, sessions) AS last_click_conversion_rate,
+  SAFE_DIVIDE(last_click_revenue, users) AS last_click_revenue_per_user,
+  SAFE_DIVIDE(last_click_revenue, NULLIF(last_click_conversions, 0)) AS last_click_aov,
+  
+  SAFE_DIVIDE(mta_conversions, sessions) AS mta_conversion_rate,
+  SAFE_DIVIDE(mta_revenue, users) AS mta_revenue_per_user,
+  SAFE_DIVIDE(mta_revenue, NULLIF(mta_conversions, 0)) AS mta_aov,
+  
+  -- ========== 元数据 ==========
+  total_daily_conversions,
+  total_daily_revenue,
+  daily_weight_sum,
+  CURRENT_TIMESTAMP() AS updated_at
+FROM
+  Final_MTA_Calculation

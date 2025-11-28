@@ -1,0 +1,18 @@
+-- 验证 3: 查看各类渠道的表现
+SELECT
+  channel_category,
+  weight_source,
+  COUNT(DISTINCT channel) AS channel_count,
+  ROUND(SUM(last_click_conversions), 0) AS total_last_click_conv,
+  ROUND(SUM(mta_conversions), 0) AS total_mta_conv,
+  ROUND(SUM(mta_conversions) - SUM(last_click_conversions), 0) AS conversion_diff,
+  ROUND(AVG(attribution_weight), 4) AS avg_weight
+FROM
+  `bigquery-2024.attribution.composite_attribution_performance`
+WHERE
+  date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+GROUP BY
+  channel_category,
+  weight_source
+ORDER BY
+  total_mta_conv DESC;

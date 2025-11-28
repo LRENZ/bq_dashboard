@@ -1,0 +1,245 @@
+config {
+  type: "table",
+  schema: "attribution_v1",
+  name: "mta_weights_complete",
+  description: "Complete MTA weights covering ALL channels",
+  tags: ["attribution", "mta", "complete"]
+}
+
+WITH
+-- 1. 获取最新的 Markov 权重
+Latest_Markov_Weights AS (
+  SELECT
+    channel,
+    Weight AS markov_weight,
+    Removal_Effect AS removal_effect,
+    Conversions AS markov_conversions,
+    Value AS markov_value,
+    run_date,
+    run_timestamp
+  FROM
+    `bigquery-2024.attribution_v1.mta_attribution_v1_markov_details`
+  WHERE
+    run_date = (
+      SELECT MAX(run_date) 
+      FROM `bigquery-2024.attribution_v1.mta_attribution_v1_markov_details`
+    )
+),
+
+-- 2. 合并所有唯一渠道
+All_Unique_Channels AS (
+  SELECT DISTINCT channel FROM `bigquery-2024.attribution.session_source_medium`
+  UNION DISTINCT
+  SELECT DISTINCT channel FROM `bigquery-2024.attribution.channel_performance`
+),
+
+-- 3. 计算旅程统计
+Journey_Stats AS (
+  SELECT
+    channel,
+    COUNT(DISTINCT unified_user_id) AS journey_users,
+    SUM(total_transactions) AS journey_conversions,
+    SUM(total_transaction_value) AS journey_revenue
+  FROM
+    `bigquery-2024.attribution.session_source_medium`
+  GROUP BY
+    channel
+),
+
+-- 4. 计算表现统计
+Performance_Stats AS (
+  SELECT
+    channel,
+    SUM(conversion) AS performance_conversions,
+    SUM(revenue) AS performance_revenue,
+    SUM(session) AS performance_sessions,
+    SUM(users) AS performance_users
+  FROM
+    `bigquery-2024.attribution.channel_performance`
+  GROUP BY
+    channel
+),
+
+-- 5. 计算总体统计
+Overall_Stats AS (
+  SELECT
+    COALESCE(SUM(js.journey_conversions), 0) AS total_journey_conversions,
+    COALESCE(SUM(js.journey_revenue), 0) AS total_journey_revenue,
+    COALESCE(SUM(ps.performance_conversions), 0) AS total_performance_conversions,
+    COALESCE(SUM(ps.performance_revenue), 0) AS total_performance_revenue
+  FROM
+    All_Unique_Channels auc
+  LEFT JOIN Journey_Stats js ON auc.channel = js.channel
+  LEFT JOIN Performance_Stats ps ON auc.channel = ps.channel
+),
+
+-- 6. 合并所有数据
+Combined_Data AS (
+  SELECT
+    auc.channel,
+    COALESCE(mw.markov_weight, 0) AS markov_weight,
+    COALESCE(mw.removal_effect, 0) AS removal_effect,
+    COALESCE(js.journey_conversions, 0) AS journey_conversions,
+    COALESCE(js.journey_revenue, 0) AS journey_revenue,
+    COALESCE(js.journey_users, 0) AS journey_users,
+    COALESCE(ps.performance_conversions, 0) AS performance_conversions,
+    COALESCE(ps.performance_revenue, 0) AS performance_revenue,
+    COALESCE(ps.performance_sessions, 0) AS performance_sessions,
+    COALESCE(ps.performance_users, 0) AS performance_users,
+    os.total_journey_conversions,
+    os.total_journey_revenue,
+    os.total_performance_conversions,
+    os.total_performance_revenue,
+    CASE
+      WHEN mw.channel IS NOT NULL AND mw.markov_weight > 0.0001 THEN 'has_markov_weight'
+      WHEN mw.channel IS NOT NULL AND mw.markov_weight <= 0.0001 THEN 'zero_markov_weight'
+      WHEN js.channel IS NOT NULL THEN 'in_journey_only'
+      WHEN ps.channel IS NOT NULL THEN 'in_performance_only'
+      ELSE 'unknown'
+    END AS channel_category,
+    mw.run_date,
+    mw.run_timestamp
+  FROM
+    All_Unique_Channels auc
+  LEFT JOIN Latest_Markov_Weights mw ON auc.channel = mw.channel
+  LEFT JOIN Journey_Stats js ON auc.channel = js.channel
+  LEFT JOIN Performance_Stats ps ON auc.channel = ps.channel
+  CROSS JOIN Overall_Stats os
+),
+
+-- 7. 计算后备权重
+Calculated_Weights AS (
+  SELECT
+    channel,
+    markov_weight,
+    removal_effect,
+    channel_category,
+    journey_conversions,
+    journey_revenue,
+    journey_users,
+    performance_conversions,
+    performance_revenue,
+    performance_sessions,
+    performance_users,
+    
+    -- 计算各维度占比
+    SAFE_DIVIDE(journey_conversions, NULLIF(total_journey_conversions, 0)) AS journey_conv_share,
+    SAFE_DIVIDE(journey_revenue, NULLIF(total_journey_revenue, 0)) AS journey_rev_share,
+    SAFE_DIVIDE(performance_conversions, NULLIF(total_performance_conversions, 0)) AS perf_conv_share,
+    SAFE_DIVIDE(performance_revenue, NULLIF(total_performance_revenue, 0)) AS perf_rev_share,
+    
+    -- 计算后备权重
+    COALESCE(SAFE_DIVIDE(journey_conversions, NULLIF(total_journey_conversions, 0)), 0) * 0.25 +
+    COALESCE(SAFE_DIVIDE(journey_revenue, NULLIF(total_journey_revenue, 0)), 0) * 0.20 +
+    COALESCE(SAFE_DIVIDE(performance_conversions, NULLIF(total_performance_conversions, 0)), 0) * 0.30 +
+    COALESCE(SAFE_DIVIDE(performance_revenue, NULLIF(total_performance_revenue, 0)), 0) * 0.25
+    AS fallback_weight,
+    
+    run_date,
+    run_timestamp
+  FROM
+    Combined_Data
+),
+
+-- 8. 确定最终权重
+Final_Weights AS (
+  SELECT
+    channel,
+    markov_weight AS original_markov_weight,
+    removal_effect,
+    channel_category,
+    fallback_weight,
+    
+    -- 最终权重逻辑
+    CASE
+      WHEN channel_category = 'has_markov_weight' THEN markov_weight
+      WHEN channel_category IN ('zero_markov_weight', 'in_journey_only', 'in_performance_only') THEN
+        GREATEST(fallback_weight, 0.0001)
+      ELSE 0.0001
+    END AS raw_weight,
+    
+    journey_conversions,
+    journey_revenue,
+    journey_users,
+    performance_conversions,
+    performance_revenue,
+    performance_sessions,
+    performance_users,
+    journey_conv_share,
+    journey_rev_share,
+    perf_conv_share,
+    perf_rev_share,
+    run_date,
+    run_timestamp
+  FROM
+    Calculated_Weights
+),
+
+-- 9. 归一化权重
+Normalized_Weights AS (
+  SELECT
+    channel,
+    original_markov_weight,
+    removal_effect,
+    channel_category,
+    fallback_weight,
+    raw_weight,
+    
+    -- 归一化
+    SAFE_DIVIDE(raw_weight, SUM(raw_weight) OVER ()) AS normalized_weight,
+    
+    -- 权重来源
+    CASE
+      WHEN channel_category = 'has_markov_weight' THEN 'Markov Chain'
+      WHEN channel_category = 'zero_markov_weight' THEN 'Fallback (Zero Markov)'
+      WHEN channel_category = 'in_journey_only' THEN 'Fallback (Journey Only)'
+      WHEN channel_category = 'in_performance_only' THEN 'Fallback (Performance Only)'
+      ELSE 'Fallback (Unknown)'
+    END AS weight_source,
+    
+    journey_conversions,
+    journey_revenue,
+    journey_users,
+    performance_conversions,
+    performance_revenue,
+    performance_sessions,
+    performance_users,
+    journey_conv_share,
+    journey_rev_share,
+    perf_conv_share,
+    perf_rev_share,
+    run_date,
+    run_timestamp
+  FROM
+    Final_Weights
+)
+
+-- 10. 最终输出
+SELECT
+  channel,
+  normalized_weight AS Weight,
+  original_markov_weight AS Original_Markov_Weight,
+  removal_effect AS Removal_Effect,
+  fallback_weight AS Fallback_Weight,
+  channel_category AS Channel_Category,
+  weight_source AS Weight_Source,
+  journey_conversions AS Journey_Conversions,
+  journey_revenue AS Journey_Revenue,
+  performance_conversions AS Performance_Conversions,
+  performance_revenue AS Performance_Revenue,
+  journey_users AS Journey_Users,
+  performance_users AS Performance_Users,
+  performance_sessions AS Performance_Sessions,
+  ROUND(COALESCE(journey_conv_share, 0) * 100, 2) AS Journey_Conv_Share_Pct,
+  ROUND(COALESCE(journey_rev_share, 0) * 100, 2) AS Journey_Rev_Share_Pct,
+  ROUND(COALESCE(perf_conv_share, 0) * 100, 2) AS Perf_Conv_Share_Pct,
+  ROUND(COALESCE(perf_rev_share, 0) * 100, 2) AS Perf_Rev_Share_Pct,
+  run_date AS Markov_Run_Date,
+  run_timestamp AS Markov_Run_Timestamp,
+  CURRENT_TIMESTAMP() AS Created_Timestamp
+FROM
+  Normalized_Weights
+WHERE
+  normalized_weight > 0
+ORDER BY
+  normalized_weight DESC

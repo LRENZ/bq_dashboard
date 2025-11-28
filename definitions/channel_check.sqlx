@@ -1,0 +1,47 @@
+-- 找出只在 channel_performance 中存在的渠道
+WITH Channels_Performance AS (
+  SELECT DISTINCT channel
+  FROM `bigquery-2024.attribution.channel_performance`
+),
+
+Channels_Journey AS (
+  SELECT DISTINCT channel
+  FROM `bigquery-2024.attribution.session_source_medium`
+)
+
+SELECT
+  'Only in channel_performance (not in journey)' AS status,
+  p.channel
+FROM
+  Channels_Performance p
+LEFT JOIN
+  Channels_Journey j
+  ON p.channel = j.channel
+WHERE
+  j.channel IS NULL
+
+UNION ALL
+
+SELECT
+  'Only in journey (not in performance)' AS status,
+  j.channel
+FROM
+  Channels_Journey j
+LEFT JOIN
+  Channels_Performance p
+  ON j.channel = p.channel
+WHERE
+  p.channel IS NULL
+
+UNION ALL
+
+SELECT
+  'In both tables' AS status,
+  p.channel
+FROM
+  Channels_Performance p
+INNER JOIN
+  Channels_Journey j
+  ON p.channel = j.channel
+ORDER BY
+  status, channel;

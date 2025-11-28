@@ -1,0 +1,53 @@
+-- 验证 1: 检查数据量和时间范围
+SELECT
+  COUNT(*) AS total_rows,
+  COUNT(DISTINCT unified_user_id) AS unique_users,
+  MIN(event_date) AS earliest_date,
+  MAX(event_date) AS latest_date,
+  SUM(total_transactions) AS total_purchases,
+  SUM(total_transaction_value) AS total_revenue
+FROM
+  `bigquery-2024.attribution.session_source_medium`;
+
+-- 验证 2: 检查渠道分布
+SELECT
+  channel,
+  COUNT(*) AS touchpoints,
+  COUNT(DISTINCT unified_user_id) AS users,
+  SUM(total_transactions) AS purchases,
+  ROUND(SUM(total_transaction_value), 2) AS revenue
+FROM
+  `bigquery-2024.attribution.session_source_medium`
+GROUP BY
+  channel
+ORDER BY
+  purchases DESC;
+
+-- 验证 3: 检查是否有空值
+SELECT
+  COUNTIF(unified_user_id IS NULL) AS null_user_id,
+  COUNTIF(channel IS NULL) AS null_channel,
+  COUNTIF(event_date IS NULL) AS null_event_date,
+  COUNTIF(total_transactions IS NULL) AS null_transactions,
+  COUNTIF(total_transaction_value IS NULL) AS null_value
+FROM
+  `bigquery-2024.attribution.session_source_medium`;
+
+-- 验证 4: 查看示例用户旅程
+SELECT
+  unified_user_id,
+  event_date,
+  channel,
+  total_transactions,
+  total_transaction_value
+FROM
+  `bigquery-2024.attribution.session_source_medium`
+WHERE
+  unified_user_id IN (
+    SELECT unified_user_id
+    FROM `bigquery-2024.attribution.session_source_medium`
+    WHERE total_transactions > 0
+    LIMIT 1
+  )
+ORDER BY
+  event_date;

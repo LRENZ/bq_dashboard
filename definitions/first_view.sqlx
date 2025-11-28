@@ -1,0 +1,838 @@
+config {
+    type: "table",
+    schema: "dataform_berlook",
+    description: "attribution model for GA4 events_* table. Basic column casting and value extractions are performed here",
+    ///uniqueKey: ['event_timestamp', 'unfied_user_id',"transaction_id", "model","source","medium","campaign"],
+    bigquery: {
+        partitionBy: "purchase_date",
+        clusterBy: ["unfied_user_id"],
+        //updatePartitionFilter: 'purchase_date >= current_date()-5'
+    }
+}
+
+WITH
+  -- ======================= 核心修改点 1: 增加可配置的 Pillar Page 归因规则 =======================
+  PillarPageConfig AS (
+    -- 在这里配置您的URL归因规则
+    -- 当用户访问的 page_location 包含 url_contains 字符串时，
+    -- 该 page_view 事件的 source, medium, campaign 将被重写。
+    SELECT * FROM UNNEST([
+        STRUCT('/pages/what-is-an-ebike' AS url_contains, 'what-is-an-ebike' AS new_source, 'pillar page' AS new_medium, 'Explore Ebikes' AS new_campaign),
+        STRUCT('/pages/cruiser-ebike' AS url_contains, 'cruiser-ebike' AS new_source, 'pillar page' AS new_medium, 'Discover 2 Learn More' AS new_campaign),
+        STRUCT('/pages/folding-ebike' AS url_contains, 'folding-ebike' AS new_source, 'pillar page' AS new_medium, 'Fold 1 Learn More' AS new_campaign),
+        STRUCT('/pages/city-ebike' AS url_contains, 'city-ebike' AS new_source, 'pillar page' AS new_medium, 'T1ST Plus Learn More' AS new_campaign)
+    ])
+  ),
+  -- ======================= Pillar Page 规则配置结束 =======================
+
+  PaymentGateways AS (
+  SELECT
+    *
+  FROM
+    UNNEST([ 'paypal.com', 'portal.afterpay.com', 'portal.clearpay.co.uk','stripe.com', 'adyen.com', 'braintree.com', 'pay.google.com', 'apple.com', 'shopify.com' ]) AS payment_source_domain ),
+
+  -- ======================= 核心修改点 2: 在源头应用 Pillar Page 规则并进行数据标准化 =======================
+  SessionEvents AS (
+  WITH RawEvents AS (
+    -- 预先提取 page_location 以便应用规则
+    SELECT
+      *,
+      (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location') AS page_location
+    FROM
+      ${ref('analytics_489554557', 'events_*')}
+    WHERE
+      event_name IN ('purchase', 'session_start', 'first_visit', 'page_view', 'refund')
+      and _table_suffix BETWEEN '20251101' and '20251110'
+  )
+  SELECT
+    COALESCE(LAST_VALUE(raw.user_id IGNORE NULLS) OVER (PARTITION BY raw.user_pseudo_id ORDER BY raw.event_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING ), raw.user_pseudo_id) AS unfied_user_id,
+    raw.event_name,
+    TIMESTAMP_MICROS(raw.event_timestamp) AS event_timestamp,
+
+    -- 应用 Pillar Page 规则: 如果匹配，则使用新规则；否则，使用原有标准化逻辑
+    COALESCE(
+      ppc.new_source,
+      REPLACE(
+        CASE
+          WHEN raw.session_traffic_source_last_click.cross_channel_campaign.source IN ('(direct)', '(not set)') THEN COALESCE(( SELECT value.string_value FROM UNNEST(raw.event_params) WHERE KEY = 'cus_utm_source'), raw.session_traffic_source_last_click.cross_channel_campaign.source)
+          ELSE raw.session_traffic_source_last_click.cross_channel_campaign.source
+        END,
+      '(direct)', 'direct')
+    ) AS session_source,
+
+    COALESCE(
+      ppc.new_medium,
+      REPLACE(
+        CASE
+          WHEN raw.session_traffic_source_last_click.cross_channel_campaign.medium IN ('(none)', '(not set)') THEN COALESCE(( SELECT value.string_value FROM UNNEST(raw.event_params) WHERE KEY = 'cus_utm_medium'), raw.session_traffic_source_last_click.cross_channel_campaign.medium)
+          ELSE raw.session_traffic_source_last_click.cross_channel_campaign.medium
+        END,
+      '(none)', 'none')
+    ) AS session_medium,
+
+    COALESCE(
+      ppc.new_campaign,
+      REPLACE(
+        CASE
+          WHEN raw.session_traffic_source_last_click.cross_channel_campaign.campaign_name IN ('(direct)', '(not set)') THEN COALESCE(( SELECT value.string_value FROM UNNEST(raw.event_params) WHERE KEY = 'cus_utm_campaign'), raw.session_traffic_source_last_click.cross_channel_campaign.campaign_name)
+          ELSE raw.session_traffic_source_last_click.cross_channel_campaign.campaign_name
+        END,
+      '(direct)', 'direct')
+    ) AS session_campaign,
+
+    raw.ecommerce.transaction_id,
+    raw.ecommerce.purchase_revenue_in_usd AS transaction_value,
+    CASE
+      WHEN raw.event_name = 'purchase' THEN DATE(TIMESTAMP_MICROS(raw.event_timestamp), "Asia/Shanghai")
+      ELSE NULL
+    END AS purchase_date
+  FROM
+    RawEvents AS raw
+  LEFT JOIN
+    PillarPageConfig AS ppc
+    -- 规则仅对 page_view 事件生效，且URL需匹配
+    ON raw.event_name = 'page_view' AND raw.page_location LIKE CONCAT('%', ppc.url_contains, '%')
+),
+  -- ======================= 标准化及规则应用修改结束 (后续代码无需改动) =======================
+
+  SessionAttributes AS (
+SELECT
+  se.unfied_user_id,
+  se.event_name,
+  se.event_timestamp,
+  se.purchase_date,
+  se.session_source,
+  se.session_medium,
+  se.session_campaign,
+  se.transaction_id,
+  se.transaction_value,
+  FIRST_VALUE(se.event_timestamp) OVER (PARTITION BY se.unfied_user_id ORDER BY se.event_timestamp) AS first_visit_timestamp,
+  MAX(
+  IF
+    (se.event_name = 'purchase', se.event_timestamp, NULL)) OVER (PARTITION BY se.unfied_user_id) AS last_purchase_time
+FROM
+  SessionEvents AS se ),
+  LastNonNullAttributes AS (
+  SELECT
+    unfied_user_id,
+    COALESCE(LAST_VALUE(session_source IGNORE NULLS) OVER (PARTITION BY unfied_user_id ORDER BY event_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), "direct") AS last_nonnull_source,
+    COALESCE(LAST_VALUE(session_medium IGNORE NULLS) OVER (PARTITION BY unfied_user_id ORDER BY event_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), "none") AS last_nonnull_medium,
+    COALESCE(LAST_VALUE(session_campaign IGNORE NULLS) OVER (PARTITION BY unfied_user_id ORDER BY event_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), "direct") AS last_nonnull_campaign
+  FROM
+    SessionAttributes ),
+  AggregatedAttributes AS (
+  SELECT
+    sa.unfied_user_id,
+    MAX(sa.purchase_date) AS purchase_date,
+    ARRAY_AGG(sa.transaction_id IGNORE NULLS
+    ORDER BY
+      sa.event_timestamp) AS transaction_ids,
+    MIN(sa.first_visit_timestamp) AS first_visit_timestamp,
+    ARRAY_AGG(
+    IF
+      (sa.event_timestamp <= sa.last_purchase_time, sa.session_source, NULL) IGNORE NULLS
+    ORDER BY
+      sa.event_timestamp) AS original_traffic_sources,
+    ARRAY_AGG(
+    IF
+      (sa.event_timestamp <= sa.last_purchase_time, sa.session_medium, NULL) IGNORE NULLS
+    ORDER BY
+      sa.event_timestamp) AS original_traffic_mediums,
+    ARRAY_AGG(
+    IF
+      (sa.event_timestamp <= sa.last_purchase_time, sa.session_campaign, NULL) IGNORE NULLS
+    ORDER BY
+      sa.event_timestamp) AS original_traffic_campaigns,
+    MAX(sa.transaction_value) AS total_transaction_value,
+    DATE_DIFF(DATE(MAX(sa.event_timestamp)), DATE(MIN(sa.first_visit_timestamp)), DAY) AS days_before_conversion,
+    MAX(sa.event_timestamp) AS event_timestamp
+  FROM
+    SessionAttributes AS sa
+  WHERE
+    sa.event_timestamp <= sa.last_purchase_time
+  GROUP BY
+    sa.unfied_user_id
+  HAVING
+    days_before_conversion <= 90 ),
+  ExpandedAttributes AS (
+  SELECT
+    aa.unfied_user_id,
+    transaction_id,
+    aa.first_visit_timestamp,
+    aa.original_traffic_sources,
+    aa.original_traffic_mediums,
+    aa.original_traffic_campaigns,
+    aa.total_transaction_value,
+    aa.days_before_conversion,
+    aa.event_timestamp,
+    aa.purchase_date
+  FROM
+    AggregatedAttributes AS aa
+  CROSS JOIN
+    UNNEST(aa.transaction_ids) AS transaction_id ),
+  PathsWithPaymentExclusion AS (
+  SELECT
+    ea.unfied_user_id,
+    ea.transaction_id,
+    ea.first_visit_timestamp,
+    ea.total_transaction_value,
+    ea.days_before_conversion,
+    ea.event_timestamp,
+    ea.purchase_date,
+    ARRAY_AGG(path.source IGNORE NULLS
+    ORDER BY
+      path.idx) AS filtered_sources,
+    ARRAY_AGG(path.medium IGNORE NULLS
+    ORDER BY
+      path.idx) AS filtered_mediums,
+    ARRAY_AGG(path.campaign IGNORE NULLS
+    ORDER BY
+      path.idx) AS filtered_campaigns
+  FROM
+    ExpandedAttributes ea,
+    UNNEST( (
+      SELECT
+        ARRAY_AGG(STRUCT(s AS SOURCE,
+            m AS medium,
+            c AS campaign,
+            i AS idx))
+      FROM
+        UNNEST(ea.original_traffic_sources) s
+      WITH
+      OFFSET
+        i
+      JOIN
+        UNNEST(ea.original_traffic_mediums) m
+      WITH
+      OFFSET
+        j
+      ON
+        i = j
+      JOIN
+        UNNEST(ea.original_traffic_campaigns) c
+      WITH
+      OFFSET
+        k
+      ON
+        i = k
+      WHERE
+        NOT ( LOWER(TRIM(m)) = 'referral'
+          AND EXISTS (
+          SELECT
+            1
+          FROM
+            PaymentGateways pg
+          WHERE
+            LOWER(TRIM(s)) LIKE CONCAT('%', pg.payment_source_domain, '%'))) ) ) AS path
+  GROUP BY
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7 ),
+  FinalPaths AS (
+  SELECT
+    p.* EXCEPT (filtered_sources,
+      filtered_mediums,
+      filtered_campaigns),
+  IF
+    (ARRAY_LENGTH(p.filtered_sources) = 0, ['direct'], p.filtered_sources) AS original_traffic_sources,
+  IF
+    (ARRAY_LENGTH(p.filtered_mediums) = 0, ['none'], p.filtered_mediums) AS original_traffic_mediums,
+  IF
+    (ARRAY_LENGTH(p.filtered_campaigns) = 0, ['direct'], p.filtered_campaigns) AS original_traffic_campaigns
+  FROM
+    PathsWithPaymentExclusion p ),
+  -- ======================= 核心修改点 2: 简化去重逻辑 =======================
+  -- 因为标准化已在上游完成，这里的逻辑可以大大简化，直接比较即可
+  DeduplicatedAttributes AS (
+WITH
+  PathsUnnested AS (
+  SELECT
+    ea.unfied_user_id,
+    ea.transaction_id,
+    ea.total_transaction_value,
+    ea.days_before_conversion,
+    ea.event_timestamp,
+    ea.purchase_date,
+    SOURCE,
+    medium,
+    campaign,
+    src_offset
+  FROM
+    FinalPaths AS ea,
+    UNNEST(ea.original_traffic_sources) AS SOURCE
+  WITH
+  OFFSET
+    AS src_offset
+  JOIN
+    UNNEST(ea.original_traffic_mediums) AS medium
+  WITH
+  OFFSET
+    AS med_offset
+  ON
+    src_offset = med_offset
+  JOIN
+    UNNEST(ea.original_traffic_campaigns) AS campaign
+  WITH
+  OFFSET
+    AS camp_offset
+  ON
+    src_offset = camp_offset ),
+  DeduplicationLogic AS (
+  SELECT
+    *,
+    -- 直接对已经标准化的值进行 LAG 操作
+    LAG(SOURCE) OVER (PARTITION BY unfied_user_id, transaction_id ORDER BY src_offset) AS prev_source,
+    LAG(medium) OVER (PARTITION BY unfied_user_id, transaction_id ORDER BY src_offset) AS prev_medium,
+    LAG(campaign) OVER (PARTITION BY unfied_user_id, transaction_id ORDER BY src_offset) AS prev_campaign
+  FROM
+    PathsUnnested )
+SELECT
+  unfied_user_id,
+  transaction_id,
+  ANY_VALUE(total_transaction_value) AS total_transaction_value,
+  ANY_VALUE(days_before_conversion) AS days_before_conversion,
+  ANY_VALUE(event_timestamp) AS event_timestamp,
+  ANY_VALUE(purchase_date) AS purchase_date,
+  ARRAY_AGG(SOURCE
+  ORDER BY
+    src_offset) AS original_traffic_sources,
+  ARRAY_AGG(medium
+  ORDER BY
+    src_offset) AS original_traffic_mediums,
+  ARRAY_AGG(campaign
+  ORDER BY
+    src_offset) AS original_traffic_campaigns,
+  COUNT(*) AS session_length
+FROM
+  DeduplicationLogic
+  -- 简化后的去重条件
+WHERE
+  prev_source IS NULL
+  OR SOURCE != prev_source
+  OR medium != prev_medium
+  OR campaign != prev_campaign
+GROUP BY
+  unfied_user_id,
+  transaction_id ),
+  -- ======================= 去重逻辑简化结束 =======================
+  -- NO CHANGES to any CTEs below this line. They will now automatically use the clean, deduplicated paths.
+  FirstClick AS (
+SELECT
+  da.unfied_user_id,
+  da.transaction_id,
+  da.event_timestamp,
+  da.purchase_date,
+  da.total_transaction_value,
+  da.days_before_conversion,
+  da.session_length,
+  da.original_traffic_sources,
+  da.original_traffic_mediums,
+  da.original_traffic_campaigns,
+  'First Click' AS MODEL,
+  IFNULL(
+  IF
+    (ARRAY_LENGTH(da.original_traffic_sources) > 0, da.original_traffic_sources[
+    OFFSET
+      (0)], NULL), COALESCE(la.last_nonnull_source, "direct")) AS SOURCE,
+  IFNULL(
+  IF
+    (ARRAY_LENGTH(da.original_traffic_mediums) > 0, da.original_traffic_mediums[
+    OFFSET
+      (0)], NULL), COALESCE(la.last_nonnull_medium, "none")) AS medium,
+  IFNULL(
+  IF
+    (ARRAY_LENGTH(da.original_traffic_campaigns) > 0, da.original_traffic_campaigns[
+    OFFSET
+      (0)], NULL), COALESCE(la.last_nonnull_campaign, "direct")) AS campaign,
+  da.total_transaction_value AS value,
+  1 AS conversion
+FROM
+  DeduplicatedAttributes AS da
+LEFT JOIN
+  LastNonNullAttributes AS la
+ON
+  da.unfied_user_id = la.unfied_user_id ),
+  LastClick AS (
+  SELECT
+    da.unfied_user_id,
+    da.transaction_id,
+    da.event_timestamp,
+    da.purchase_date,
+    da.total_transaction_value,
+    da.days_before_conversion,
+    da.session_length,
+    da.original_traffic_sources,
+    da.original_traffic_mediums,
+    da.original_traffic_campaigns,
+    'Last Click' AS MODEL,
+    IFNULL(
+    IF
+      (ARRAY_LENGTH(da.original_traffic_sources) > 0, da.original_traffic_sources[ORDINAL(ARRAY_LENGTH(da.original_traffic_sources))], NULL), COALESCE(la.last_nonnull_source, "direct")) AS SOURCE,
+    IFNULL(
+    IF
+      (ARRAY_LENGTH(da.original_traffic_mediums) > 0, da.original_traffic_mediums[ORDINAL(ARRAY_LENGTH(da.original_traffic_mediums))], NULL), COALESCE(la.last_nonnull_medium, "none")) AS medium,
+    IFNULL(
+    IF
+      (ARRAY_LENGTH(da.original_traffic_campaigns) > 0, da.original_traffic_campaigns[ORDINAL(ARRAY_LENGTH(da.original_traffic_campaigns))], NULL), COALESCE(la.last_nonnull_campaign, "direct")) AS campaign,
+    da.total_transaction_value AS value,
+    1 AS conversion
+  FROM
+    DeduplicatedAttributes AS da
+  LEFT JOIN
+    LastNonNullAttributes AS la
+  ON
+    da.unfied_user_id = la.unfied_user_id ),
+  Linear AS (
+  SELECT
+    da.unfied_user_id,
+    da.transaction_id,
+    da.event_timestamp,
+    da.purchase_date,
+    da.total_transaction_value,
+    da.days_before_conversion,
+    da.session_length,
+    'Linear' AS MODEL,
+    ts AS SOURCE,
+    tm AS medium,
+    tc AS campaign,
+    da.total_transaction_value / ARRAY_LENGTH(da.original_traffic_sources) AS value,
+    da.original_traffic_sources,
+    da.original_traffic_mediums,
+    da.original_traffic_campaigns,
+    1.0 / ARRAY_LENGTH(da.original_traffic_sources) AS conversion
+  FROM
+    DeduplicatedAttributes AS da
+  LEFT JOIN
+    UNNEST(da.original_traffic_sources) AS ts
+  WITH
+  OFFSET
+    AS ts_offset
+  JOIN
+    UNNEST(da.original_traffic_mediums) AS tm
+  WITH
+  OFFSET
+    AS tm_offset
+  JOIN
+    UNNEST(da.original_traffic_campaigns) AS tc
+  WITH
+  OFFSET
+    AS tc_offset
+  WHERE
+    ts_offset = tm_offset
+    AND tm_offset = tc_offset ),
+  TimeDecay AS (
+  SELECT
+    da.unfied_user_id,
+    da.transaction_id,
+    da.event_timestamp,
+    da.purchase_date,
+    da.total_transaction_value,
+    da.days_before_conversion,
+    da.session_length,
+    'Time Decay' AS MODEL,
+    time_decay_source AS SOURCE,
+    time_decay_medium AS medium,
+    time_decay_campaign AS campaign,
+    da.original_traffic_sources,
+    da.original_traffic_mediums,
+    da.original_traffic_campaigns,
+  IF
+    (da.session_length = 1, 1, IFNULL(time_decay_value / NULLIF(SUM(time_decay_value) OVER(PARTITION BY da.transaction_id, da.unfied_user_id), 0), 1.0 / NULLIF(ARRAY_LENGTH(da.original_traffic_sources), 0))) AS conversion,
+  IF
+    (da.session_length = 1, da.total_transaction_value, IFNULL(time_decay_value * da.total_transaction_value / NULLIF(SUM(time_decay_value) OVER(PARTITION BY da.transaction_id, da.unfied_user_id), 0), da.total_transaction_value / NULLIF(ARRAY_LENGTH(da.original_traffic_sources), 0))) AS value
+  FROM
+    DeduplicatedAttributes AS da
+  CROSS JOIN
+    UNNEST( ARRAY(
+      SELECT
+        AS STRUCT ts AS time_decay_source, tm AS time_decay_medium, tc AS time_decay_campaign, IFNULL(EXP(-(ARRAY_LENGTH(da.original_traffic_sources) - INDEX) * 0.3) * da.total_transaction_value / NULLIF(SUM(EXP(-(ARRAY_LENGTH(da.original_traffic_sources) - i) * 0.5)) OVER(), 0), 0 ) AS time_decay_value
+      FROM
+        UNNEST(da.original_traffic_sources) AS ts
+      WITH
+      OFFSET
+        AS INDEX
+      JOIN
+        UNNEST(da.original_traffic_mediums) AS tm
+      WITH
+      OFFSET
+        AS i
+      JOIN
+        UNNEST(da.original_traffic_campaigns) AS tc
+      WITH
+      OFFSET
+        AS j
+      WHERE
+        INDEX = i
+        AND i = j
+      ORDER BY
+        INDEX DESC) ) ),
+  PositionBased AS (
+  SELECT
+    da.unfied_user_id,
+    da.transaction_id,
+    da.event_timestamp,
+    da.purchase_date,
+    da.total_transaction_value,
+    da.days_before_conversion,
+    da.session_length,
+    da.original_traffic_sources,
+    da.original_traffic_mediums,
+    da.original_traffic_campaigns,
+    'Position-Based' AS MODEL,
+    ts AS SOURCE,
+    tm AS medium,
+    tc AS campaign,
+    CASE
+      WHEN ARRAY_LENGTH(da.original_traffic_sources) = 1 THEN da.total_transaction_value
+      WHEN ARRAY_LENGTH(da.original_traffic_sources) = 2 THEN da.total_transaction_value * 0.5
+      WHEN idx = 0 THEN da.total_transaction_value * 0.4
+      WHEN idx = ARRAY_LENGTH(da.original_traffic_sources) - 1 THEN da.total_transaction_value * 0.4
+      ELSE da.total_transaction_value * 0.2 / (ARRAY_LENGTH(da.original_traffic_sources) - 2)
+  END
+    AS value,
+    CASE
+      WHEN ARRAY_LENGTH(da.original_traffic_sources) = 1 THEN 1.0
+      WHEN ARRAY_LENGTH(da.original_traffic_sources) = 2 THEN 0.5
+      WHEN idx = 0 THEN 0.4
+      WHEN idx = ARRAY_LENGTH(da.original_traffic_sources) - 1 THEN 0.4
+      ELSE 0.2 / (ARRAY_LENGTH(da.original_traffic_sources) - 2)
+  END
+    AS conversion
+  FROM
+    DeduplicatedAttributes AS da
+  JOIN
+    UNNEST(da.original_traffic_sources) AS ts
+  WITH
+  OFFSET
+    AS idx
+  JOIN
+    UNNEST(da.original_traffic_mediums) AS tm
+  WITH
+  OFFSET
+    AS i
+  JOIN
+    UNNEST(da.original_traffic_campaigns) AS tc
+  WITH
+  OFFSET
+    AS j
+  WHERE
+    idx = i
+    AND i = j
+  ORDER BY
+    idx ASC ),
+  AllModels AS (
+  SELECT
+    DISTINCT unfied_user_id,
+    transaction_id,
+    event_timestamp,
+    total_transaction_value,
+    days_before_conversion,
+    session_length,
+    purchase_date,
+    MODEL,
+    SOURCE,
+    medium,
+    campaign,
+    value,
+    original_traffic_sources,
+    original_traffic_mediums,
+    original_traffic_campaigns,
+    conversion,
+    ROW_NUMBER() OVER (PARTITION BY unfied_user_id, transaction_id ORDER BY event_timestamp) AS visit_order,
+    (
+    SELECT
+      idx + 1
+    FROM
+      UNNEST(original_traffic_sources)
+    WITH
+    OFFSET
+      AS idx
+    WHERE
+      original_traffic_sources[idx] = SOURCE
+    LIMIT
+      1) AS source_index,
+    (
+    SELECT
+      idx + 1
+    FROM
+      UNNEST(original_traffic_mediums)
+    WITH
+    OFFSET
+      AS idx
+    WHERE
+      original_traffic_mediums[idx] = medium
+    LIMIT
+      1) AS medium_index,
+    (
+    SELECT
+      idx + 1
+    FROM
+      UNNEST(original_traffic_campaigns)
+    WITH
+    OFFSET
+      AS idx
+    WHERE
+      original_traffic_campaigns[idx] = campaign
+    LIMIT
+      1) AS campaign_index
+  FROM
+    FirstClick AS f
+  UNION ALL
+  SELECT
+    DISTINCT l.unfied_user_id,
+    l.transaction_id,
+    l.event_timestamp,
+    l.total_transaction_value,
+    l.days_before_conversion,
+    l.session_length,
+    l.purchase_date,
+    l.model,
+    l.source,
+    l.medium,
+    l.campaign,
+    l.value,
+    l.original_traffic_sources,
+    l.original_traffic_mediums,
+    l.original_traffic_campaigns,
+    l.conversion,
+    ROW_NUMBER() OVER (PARTITION BY l.unfied_user_id, l.transaction_id ORDER BY l.event_timestamp) AS visit_order,
+    (
+    SELECT
+      idx + 1
+    FROM
+      UNNEST(original_traffic_sources)
+    WITH
+    OFFSET
+      AS idx
+    WHERE
+      original_traffic_sources[idx] = l.source
+    LIMIT
+      1) AS source_index,
+    (
+    SELECT
+      idx + 1
+    FROM
+      UNNEST(original_traffic_mediums)
+    WITH
+    OFFSET
+      AS idx
+    WHERE
+      original_traffic_mediums[idx] = l.medium
+    LIMIT
+      1) AS medium_index,
+    (
+    SELECT
+      idx + 1
+    FROM
+      UNNEST(original_traffic_campaigns)
+    WITH
+    OFFSET
+      AS idx
+    WHERE
+      original_traffic_campaigns[idx] = l.campaign
+    LIMIT
+      1) AS campaign_index
+  FROM
+    LastClick AS l
+  UNION ALL
+  SELECT
+    ln.unfied_user_id,
+    ln.transaction_id,
+    ln.event_timestamp,
+    ln.total_transaction_value,
+    ln.days_before_conversion,
+    ln.session_length,
+    ln.purchase_date,
+    ln.model,
+    ln.source,
+    ln.medium,
+    ln.campaign,
+    ln.value,
+    ln.original_traffic_sources,
+    ln.original_traffic_mediums,
+    ln.original_traffic_campaigns,
+    ln.conversion,
+    ROW_NUMBER() OVER (PARTITION BY ln.unfied_user_id, ln.transaction_id ORDER BY ln.event_timestamp) AS visit_order,
+    (
+    SELECT
+      idx + 1
+    FROM
+      UNNEST(original_traffic_sources)
+    WITH
+    OFFSET
+      AS idx
+    WHERE
+      original_traffic_sources[idx] = ln.source
+    LIMIT
+      1) AS source_index,
+    (
+    SELECT
+      idx + 1
+    FROM
+      UNNEST(original_traffic_mediums)
+    WITH
+    OFFSET
+      AS idx
+    WHERE
+      original_traffic_mediums[idx] = ln.medium
+    LIMIT
+      1) AS medium_index,
+    (
+    SELECT
+      idx + 1
+    FROM
+      UNNEST(original_traffic_campaigns)
+    WITH
+    OFFSET
+      AS idx
+    WHERE
+      original_traffic_campaigns[idx] = ln.campaign
+    LIMIT
+      1) AS campaign_index
+  FROM
+    Linear AS ln
+  UNION ALL
+  SELECT
+    td.unfied_user_id,
+    td.transaction_id,
+    td.event_timestamp,
+    td.total_transaction_value,
+    td.days_before_conversion,
+    td.session_length,
+    td.purchase_date,
+    td.model,
+    td.source,
+    td.medium,
+    td.campaign,
+    td.value,
+    td.original_traffic_sources,
+    td.original_traffic_mediums,
+    td.original_traffic_campaigns,
+    td.conversion,
+    ROW_NUMBER() OVER (PARTITION BY td.unfied_user_id, td.transaction_id ORDER BY td.event_timestamp) AS visit_order,
+    (
+    SELECT
+      idx + 1
+    FROM
+      UNNEST(original_traffic_sources)
+    WITH
+    OFFSET
+      AS idx
+    WHERE
+      original_traffic_sources[idx] = td.source
+    LIMIT
+      1) AS source_index,
+    (
+    SELECT
+      idx + 1
+    FROM
+      UNNEST(original_traffic_mediums)
+    WITH
+    OFFSET
+      AS idx
+    WHERE
+      original_traffic_mediums[idx] = td.medium
+    LIMIT
+      1) AS medium_index,
+    (
+    SELECT
+      idx + 1
+    FROM
+      UNNEST(original_traffic_campaigns)
+    WITH
+    OFFSET
+      AS idx
+    WHERE
+      original_traffic_campaigns[idx] = td.campaign
+    LIMIT
+      1) AS campaign_index
+  FROM
+    TimeDecay AS td
+  UNION ALL
+  SELECT
+    pb.unfied_user_id,
+    pb.transaction_id,
+    pb.event_timestamp,
+    pb.total_transaction_value,
+    pb.days_before_conversion,
+    pb.session_length,
+    pb.purchase_date,
+    pb.model,
+    pb.source,
+    pb.medium,
+    pb.campaign,
+    pb.value,
+    pb.original_traffic_sources,
+    pb.original_traffic_mediums,
+    pb.original_traffic_campaigns,
+    pb.conversion,
+    ROW_NUMBER() OVER (PARTITION BY pb.unfied_user_id, pb.transaction_id ORDER BY pb.event_timestamp) AS visit_order,
+    (
+    SELECT
+      idx + 1
+    FROM
+      UNNEST(original_traffic_sources)
+    WITH
+    OFFSET
+      AS idx
+    WHERE
+      original_traffic_sources[idx] = pb.source
+    LIMIT
+      1) AS source_index,
+    (
+    SELECT
+      idx + 1
+    FROM
+      UNNEST(original_traffic_mediums)
+    WITH
+    OFFSET
+      AS idx
+    WHERE
+      original_traffic_mediums[idx] = pb.medium
+    LIMIT
+      1) AS medium_index,
+    (
+    SELECT
+      idx + 1
+    FROM
+      UNNEST(original_traffic_campaigns)
+    WITH
+    OFFSET
+      AS idx
+    WHERE
+      original_traffic_campaigns[idx] = pb.campaign
+    LIMIT
+      1) AS campaign_index
+  FROM
+    PositionBased AS pb ),
+  final AS (
+  SELECT
+    *
+  FROM
+    AllModels
+  WHERE
+    --transaction_id IS NOT NULL
+   -- AND
+     ( (MODEL = 'First Click'
+        AND visit_order = 1) OR(MODEL = 'Last Click'
+        AND visit_order = 1)
+      OR MODEL NOT IN ('First Click',
+        'Last Click') ) ),
+  final_ect AS (
+  SELECT
+    *
+  FROM
+    final
+ --- WHERE
+    ---transaction_id IS NOT NULL
+    ---AND value > 0 
+    )
+SELECT
+  *
+FROM
+  final_ect 
+  where medium = 'pillar page'

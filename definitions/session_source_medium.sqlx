@@ -1,0 +1,378 @@
+config {
+  type: "table",
+  schema: "attribution",
+  name: "session_source_medium",
+  description: "User journey data with all channel touchpoints for attribution modeling"
+}
+
+-- ============================================================================
+-- 多渠道归因数据准备 SQL
+-- 目标：为 Python 归因模型提供完整的用户渠道旅程数据
+-- 必需字段：unified_user_id, channel, event_date, total_transactions, total_transaction_value
+-- ============================================================================
+
+-- 1. Pillar Page 配置
+WITH PillarPageConfig AS (
+  SELECT * FROM UNNEST([
+    STRUCT('/pages/what-is-an-ebike' AS url_contains, 'what-is-an-ebike' AS new_source, 'pillar page' AS new_medium),
+    STRUCT('/pages/cruiser-ebike' AS url_contains, 'cruiser-ebike' AS new_source, 'pillar page' AS new_medium),
+    STRUCT('/pages/folding-ebike' AS url_contains, 'folding-ebike' AS new_source, 'pillar page' AS new_medium),
+    STRUCT('/pages/city-ebike' AS url_contains, 'city-ebike' AS new_source, 'pillar page' AS new_medium)
+  ])
+),
+
+-- 2. 事件层数据提取
+SessionEvents AS (
+  WITH RawEvents AS (
+    SELECT
+      *,
+      (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location') AS page_location
+    FROM
+      ${ref('analytics_489554557', 'events_*')}
+    WHERE
+      event_name IN ('purchase', 'session_start', 'first_visit', 'page_view')
+      AND NOT (ecommerce.transaction_id IS NOT NULL AND ecommerce.purchase_revenue_in_usd = 0)
+      -- 限制时间范围以提高性能
+      AND _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY))
+                             AND FORMAT_DATE('%Y%m%d', CURRENT_DATE())
+  )
+  SELECT
+    -- 统一用户ID（优先使用 user_id，否则使用 user_pseudo_id）
+    COALESCE(
+      LAST_VALUE(raw.user_id IGNORE NULLS) OVER (
+        PARTITION BY raw.user_pseudo_id 
+        ORDER BY raw.event_timestamp 
+        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+      ),
+      raw.user_pseudo_id
+    ) AS unified_user_id,
+    
+    raw.event_timestamp,
+    raw.event_name,
+    
+    -- 来源（Source）
+    COALESCE(
+      ppc.new_source,  -- Pillar Page 优先
+      raw.session_traffic_source_last_click.cross_channel_campaign.source,
+      (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'source'),
+      '(direct)'
+    ) AS source,
+    
+    -- 媒介（Medium）
+    COALESCE(
+      ppc.new_medium,
+      raw.session_traffic_source_last_click.cross_channel_campaign.medium,
+      (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'medium'),
+      '(none)'
+    ) AS medium,
+    
+    -- 营销活动（Campaign）
+    COALESCE(
+      raw.session_traffic_source_last_click.cross_channel_campaign.campaign_name,
+      (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'campaign'),
+      '(not set)'
+    ) AS campaign,
+    
+    raw.page_location,
+    raw.ecommerce.transaction_id,
+    raw.ecommerce.purchase_revenue_in_usd AS transaction_value
+  FROM
+    RawEvents AS raw
+  LEFT JOIN
+    PillarPageConfig AS ppc
+    ON raw.event_name = 'page_view' 
+    AND raw.page_location LIKE CONCAT('%', ppc.url_contains, '%')
+),
+
+-- 3. 渠道映射
+AllTouchpoints AS (
+  SELECT
+    unified_user_id,
+    event_timestamp,
+    event_name,
+    source,
+    medium,
+    campaign,
+    
+    -- 渠道分类逻辑
+    CASE
+      -- Pillar Page
+      WHEN medium = 'pillar page' THEN 'Pillar Page'
+      
+      -- Affiliates
+      WHEN REGEXP_CONTAINS(LOWER(medium), r'affiliate|avantlink|uppromote|goaffpro|impact')
+        OR REGEXP_CONTAINS(LOWER(source), r'affiliate|avantlink|uppromote|goaffpro|impact') 
+        THEN 'Affiliates'
+      
+      -- SMS
+      WHEN REGEXP_CONTAINS(LOWER(medium), r'sms') THEN 'SMS'
+      
+      -- Email
+      WHEN REGEXP_CONTAINS(LOWER(source), r'klaviyo|email|substack|wunderkind')
+        OR LOWER(medium) = 'edm' THEN 'Email'
+      
+      -- KOL
+      WHEN REGEXP_CONTAINS(LOWER(medium), r'kol') OR LOWER(source) = 'kol' THEN 'KOL'
+      
+      -- Programmatic Ads
+      WHEN LOWER(medium) = 'programmatic'
+        OR REGEXP_CONTAINS(LOWER(source), r'ttd|outbrain|loopme|criteo|tradedesk') 
+        THEN 'Programmatic Ads'
+      
+      -- Paid Brand Search
+      WHEN (LOWER(medium) IN ('cpc', 'ppc', 'paidsearch') OR REGEXP_CONTAINS(LOWER(source), r'^(google|bing)$'))
+        AND REGEXP_CONTAINS(LOWER(campaign), r'brand') THEN 'Paid Brand Search'
+      
+      -- Paid Non-Brand Search
+      WHEN (LOWER(medium) IN ('cpc', 'ppc', 'paidsearch') OR REGEXP_CONTAINS(LOWER(source), r'^(google|bing)$'))
+        AND (NOT REGEXP_CONTAINS(LOWER(campaign), r'brand') OR campaign IS NULL) 
+        THEN 'Paid Non-Brand Search'
+      
+      -- Organic Search
+      WHEN LOWER(medium) = 'organic' THEN 'Organic Search'
+      
+      -- Paid Social
+      WHEN (REGEXP_CONTAINS(LOWER(source), r'facebook|twitter|youtube|instagram|reddit|fb|quora')
+        OR LOWER(medium) = 'paidsocial')
+        AND LOWER(medium) != 'referral' THEN 'Paid Social'
+      
+      -- Organic Social
+      WHEN LOWER(medium) IN ('social', 'social-network', 'social-media')
+        OR (REGEXP_CONTAINS(LOWER(source), r'facebook|twitter|instagram|linkedin|pinterest|tiktok|youtube|t\.co|reddit')
+        AND NOT REGEXP_CONTAINS(LOWER(medium), r'cpc|ppc|paid|cpv|cpa|display|banner')) 
+        THEN 'Organic Social'
+      
+      -- Paid Video
+      WHEN LOWER(medium) = 'paidvideo' THEN 'Paid Video'
+      
+      -- Organic Video
+      WHEN LOWER(medium) = 'organic video' THEN 'Organic Video'
+      
+      -- Paid Shopping
+      WHEN LOWER(medium) = 'shopping' OR REGEXP_CONTAINS(LOWER(campaign), r'shopping') 
+        THEN 'Paid Shopping'
+      
+      -- Organic Shopping
+      WHEN LOWER(source) IN ('google shopping', 'shopping.google.com') THEN 'Organic Shopping'
+      
+      -- Paid Display
+      WHEN LOWER(medium) IN ('display', 'cpm', 'banner', 'paiddisplay') THEN 'Paid Display'
+      
+      -- Cross-network
+      WHEN LOWER(source) = 'google' AND LOWER(medium) = 'cross-network' THEN 'Cross-network'
+      
+      -- Audio
+      WHEN LOWER(medium) = 'audio' THEN 'Audio'
+      
+      -- Mobile Push Notifications
+      WHEN LOWER(source) = '(not set)' AND LOWER(medium) = 'push' THEN 'Mobile Push Notifications'
+      
+      -- Paid Other
+      WHEN REGEXP_CONTAINS(LOWER(medium), r'paid') THEN 'Paid Other'
+      
+      -- Paid Referral
+      WHEN LOWER(medium) IN ('ads', 'pr', 'paidreferral')
+        OR REGEXP_CONTAINS(LOWER(source), r'capitaloneshopping') THEN 'Paid Referral'
+      
+      -- Organic Referral
+      WHEN LOWER(medium) = 'referral'
+        OR REGEXP_CONTAINS(LOWER(source), r'chatgpt')
+        OR LOWER(medium) = 'earnedreferral' THEN 'Organic Referral'
+      
+      -- Direct
+      WHEN LOWER(source) = '(direct)' OR LOWER(medium) IN ('(none)', 'none') THEN 'Direct'
+      
+      -- Connected TV
+      WHEN REGEXP_CONTAINS(LOWER(medium), r'tv|television|connectedtv')
+        OR REGEXP_CONTAINS(LOWER(source), r'mntn') THEN 'Connected TV'
+      
+      -- Unassigned
+      ELSE 'Unassigned'
+    END AS channel,
+    
+    -- 是否付费流量标识
+    CASE 
+      WHEN LOWER(medium) LIKE '%cpc%' 
+        OR LOWER(medium) LIKE '%paid%'
+        OR LOWER(medium) IN ('ppc', 'display', 'cpm', 'banner', 'video', 'shopping')
+        OR REGEXP_CONTAINS(LOWER(source), r'capitaloneshopping') 
+        THEN TRUE
+      ELSE FALSE
+    END AS is_paid_traffic,
+    
+    transaction_id,
+    transaction_value
+  FROM
+    SessionEvents
+),
+
+-- 4. 识别购买事件
+PurchaseEvents AS (
+  SELECT
+    unified_user_id,
+    transaction_id,
+    event_timestamp AS purchase_timestamp,
+    transaction_value,
+    DATE(TIMESTAMP_MICROS(event_timestamp), "America/Los_Angeles") AS purchase_date,
+    
+    -- 获取上一次购买时间戳（用于区分不同购买旅程）
+    LAG(event_timestamp, 1, 0) OVER (
+      PARTITION BY unified_user_id 
+      ORDER BY event_timestamp
+    ) AS previous_purchase_timestamp
+  FROM
+    AllTouchpoints
+  WHERE
+    transaction_id IS NOT NULL
+    AND transaction_value > 0
+    -- 限制分析时间窗口（最近30天）
+    AND DATE(TIMESTAMP_MICROS(event_timestamp), "America/Los_Angeles") >= 
+        DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 30 DAY)
+),
+
+-- 5. 构建用户购买旅程路径
+TransactionJourneys AS (
+  SELECT
+    p.unified_user_id,
+    p.transaction_id,
+    p.purchase_date,
+    p.transaction_value,
+    
+    -- 聚合该购买前的所有触点
+    ARRAY_AGG(
+      STRUCT(
+        t.channel,
+        t.event_name,
+        t.event_timestamp,
+        t.is_paid_traffic,
+        t.source,
+        t.medium
+      ) 
+      ORDER BY t.event_timestamp
+    ) AS touchpoint_path
+  FROM
+    PurchaseEvents AS p
+  JOIN
+    AllTouchpoints AS t
+    ON p.unified_user_id = t.unified_user_id
+  WHERE
+    -- 只包含本次购买旅程中的触点
+    t.event_timestamp > p.previous_purchase_timestamp
+    AND t.event_timestamp <= p.purchase_timestamp
+  GROUP BY
+    1, 2, 3, 4
+),
+
+-- 6. 展开路径为行级数据
+ExpandedPath AS (
+  SELECT
+    t.unified_user_id,
+    TIMESTAMP_MICROS(touchpoint.event_timestamp) AS event_date,
+    touchpoint.event_name,
+    touchpoint.channel,
+    touchpoint.is_paid_traffic,
+    touchpoint.source,
+    touchpoint.medium,
+    t.transaction_value,
+    t.purchase_date,
+    t.transaction_id
+  FROM
+    TransactionJourneys AS t
+  CROSS JOIN
+    UNNEST(t.touchpoint_path) AS touchpoint
+),
+
+-- 7. 标记购买事件并去重连续相同渠道
+PathWithTransactions AS (
+  SELECT
+    unified_user_id,
+    event_date,
+    channel,
+    is_paid_traffic,
+    source,
+    medium,
+    
+    -- 标记是否为购买事件
+    CASE WHEN event_name = 'purchase' THEN 1 ELSE 0 END AS total_transactions,
+    CASE WHEN event_name = 'purchase' THEN transaction_value ELSE 0 END AS total_transaction_value,
+    CASE WHEN event_name = 'purchase' THEN TRUE ELSE FALSE END AS has_transaction,
+    
+    -- 获取前一个渠道（用于去重）
+    LAG(channel) OVER (
+      PARTITION BY unified_user_id, transaction_id 
+      ORDER BY event_date
+    ) AS prev_channel,
+    
+    event_name,
+    purchase_date,
+    transaction_id
+  FROM
+    ExpandedPath
+),
+
+-- 8. 最终输出：去除连续重复渠道，保留购买事件
+FinalOutput AS (
+  SELECT
+    unified_user_id,
+    event_date,
+    channel,
+    is_paid_traffic,
+    source,
+    medium,
+    total_transactions,
+    total_transaction_value,
+    has_transaction,
+    purchase_date,
+    transaction_id
+  FROM
+    PathWithTransactions
+  WHERE
+    -- 保留以下情况：
+    -- 1. 第一个触点（prev_channel IS NULL）
+    -- 2. 渠道发生变化（channel != prev_channel）
+    -- 3. 购买事件（必须保留）
+    prev_channel IS NULL
+    OR channel != prev_channel
+    OR event_name = 'purchase'
+)
+
+-- 最终查询：按 Python 模型要求的格式输出
+SELECT
+  unified_user_id,
+  event_date,
+  channel,
+  is_paid_traffic,
+  source,
+  medium,
+  
+  -- 聚合同一用户、同一渠道、同一天的数据
+  SUM(total_transactions) AS total_transactions,
+  SUM(total_transaction_value) AS total_transaction_value,
+  
+  -- 如果当天有任何购买，标记为 TRUE
+  MAX(has_transaction) AS has_transaction
+FROM
+  FinalOutput
+GROUP BY
+  unified_user_id,
+  event_date,
+  channel,
+  is_paid_traffic,
+  source,
+  medium
+ORDER BY
+  unified_user_id,
+  event_date
+
+-- ============================================================================
+-- 输出字段说明：
+-- unified_user_id: 统一用户ID（必需）
+-- event_date: 事件日期时间戳（必需）
+-- channel: 渠道名称（必需）
+-- is_paid_traffic: 是否付费流量
+-- source: 原始来源
+-- medium: 原始媒介
+-- total_transactions: 交易次数（必需）
+-- total_transaction_value: 交易金额（必需）
+-- has_transaction: 是否有交易（辅助字段）
+-- ============================================================================

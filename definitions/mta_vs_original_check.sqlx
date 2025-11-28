@@ -1,0 +1,71 @@
+-- 完整验证查询
+WITH Daily_Validation AS (
+  SELECT
+    date,
+    
+    -- Last Click 总和
+    SUM(last_click_conversions) AS lc_total_conv,
+    SUM(last_click_revenue) AS lc_total_rev,
+    
+    -- MTA 总和
+    SUM(mta_conversions) AS mta_total_conv,
+    SUM(mta_revenue) AS mta_total_rev,
+    
+    -- 差异
+    ROUND(SUM(last_click_conversions) - SUM(mta_conversions), 6) AS conv_diff,
+    ROUND(SUM(last_click_revenue) - SUM(mta_revenue), 6) AS rev_diff,
+    
+    -- 权重总和
+    SUM(attribution_weight) AS weight_sum,
+    
+    -- 渠道数量
+    COUNT(*) AS channel_count,
+    
+    -- 元数据
+    MAX(total_daily_conversions) AS expected_conv,
+    MAX(total_daily_revenue) AS expected_rev
+  FROM
+    `bigquery-2024.attribution.composite_attribution_performance`
+  WHERE
+    date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+  GROUP BY
+    date
+)
+
+SELECT
+  date,
+  
+  -- Last Click
+  lc_total_conv,
+  lc_total_rev,
+  
+  -- MTA
+  mta_total_conv,
+  mta_total_rev,
+  
+  -- 差异
+  conv_diff,
+  rev_diff,
+  
+  -- 验证
+  weight_sum,
+  channel_count,
+  
+  -- 状态
+  CASE
+    WHEN ABS(conv_diff) < 0.01 AND ABS(rev_diff) < 0.01 THEN '✅ 完全一致'
+    WHEN ABS(conv_diff) < 0.1 AND ABS(rev_diff) < 1.0 THEN '⚠️ 基本一致（浮点数误差）'
+    ELSE CONCAT('❌ 不一致 (Conv: ', CAST(conv_diff AS STRING), ', Rev: ', CAST(rev_diff AS STRING), ')')
+  END AS validation_status,
+  
+  -- 详细检查
+  CASE
+    WHEN ABS(lc_total_conv - expected_conv) > 0.01 THEN '❌ Last Click 总和与预期不符'
+    WHEN ABS(mta_total_conv - expected_conv) > 0.01 THEN '❌ MTA 总和与预期不符'
+    WHEN ABS(weight_sum - 1.0) > 0.01 THEN CONCAT('⚠️ 权重总和 = ', CAST(weight_sum AS STRING))
+    ELSE '✅ 所有检查通过'
+  END AS detail_check
+FROM
+  Daily_Validation
+ORDER BY
+  date DESC;
