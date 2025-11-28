@@ -1,6 +1,0 @@
-config { type: "view" }
-
-SELECT
-  *
-FROM
-  ML.EVALUATE(MODEL ${ref("offline_intent_model")})
