@@ -24,36 +24,36 @@ Session_Raw AS (
     DATE(TIMESTAMP_MICROS(event_timestamp), "America/Los_Angeles") AS date,
     (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'session_engaged') AS session_engaged_param,
     
-    -- [修改] 获取 Default Channel Group 用于判断
+    -- 获取 Default Channel Group 用于判断
     session_traffic_source_last_click.cross_channel_campaign.default_channel_group AS default_channel_group,
 
-    -- [修改] 统一转为小写 (Source)
+    -- 统一转为小写 (Source)
     LOWER(COALESCE(
       session_traffic_source_last_click.cross_channel_campaign.source,
       (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'source'),
       '(direct)'
     )) AS session_source,
     
-    -- [修改] 统一转为小写 (Medium)
+    -- 统一转为小写 (Medium)
     LOWER(COALESCE(
       session_traffic_source_last_click.cross_channel_campaign.medium,
       (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'medium'),
       '(none)'
     )) AS session_medium,
     
-    -- [修改] 统一转为小写 (Campaign)
+    -- 统一转为小写 (Campaign) - *注意：虽然最后不输出，但中间逻辑判断仍需要此字段*
     LOWER(COALESCE(
       session_traffic_source_last_click.cross_channel_campaign.campaign_name,
       (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'campaign'),
       '(not set)'
     )) AS session_campaign,
     
-    -- [修改] page_location 转小写用于 Pillar Page 匹配
+    -- page_location 转小写用于 Pillar Page 匹配
     LOWER((SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location')) AS page_location,
     
     event_name,
     ecommerce.transaction_id,
-    -- [修改] 包含 0 元订单
+    -- 包含 0 元订单
     COALESCE(ecommerce.purchase_revenue_in_usd, 0) AS purchase_revenue_in_usd
   FROM
     ${ref('analytics_489554557', 'events_*')}
@@ -61,7 +61,7 @@ Session_Raw AS (
     _TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 30 DAY))
 ),
 
--- 2. 渠道映射 (复用之前的完整逻辑)
+-- 2. 渠道映射 (完整复用逻辑)
 Session_Channel_Mapped AS (
   SELECT
     date,
@@ -71,21 +71,18 @@ Session_Channel_Mapped AS (
     transaction_id,
     purchase_revenue_in_usd,
     session_engaged_param,
-    session_campaign, -- 保留 Campaign 用于输出/调试
     
-    -- 渠道分类逻辑 (使用 session_ 前缀的字段)
+    -- 渠道分类逻辑
     CASE
       -- ======================================================================
       -- 规则 3: Pillar Page (优先级最高)
-      -- 定义: campaign 包含指定标签 (-) 且 访问特定页面
       -- ======================================================================
       WHEN REGEXP_CONTAINS(session_campaign, r'-aw|-cs|-cv|-rt')
            AND REGEXP_CONTAINS(page_location, r'/pages/(what-is-an-ebike|cruiser-ebike|folding-ebike|city-ebike|fat-tire-ebike)')
       THEN 'pillar page'
 
       -- ======================================================================
-      -- 规则 1: 自定义 Paid Ads 渠道
-      -- 定义: 基于 campaign 后缀 (-)
+      -- 规则 1: 自定义 Paid Ads 渠道 (使用 - 判断)
       -- ======================================================================
       WHEN CONTAINS_SUBSTR(session_campaign, '-aw') THEN 'paid_ads:branding'
       WHEN CONTAINS_SUBSTR(session_campaign, '-cs') THEN 'paid_ads:traffic'
@@ -218,12 +215,11 @@ Session_Channel_Mapped AS (
     Session_Raw
 ),
 
--- 3. 最终聚合
+-- 3. 最终聚合 (移除 Campaign 分组)
 Final_Aggregation AS (
   SELECT
     channel,
     date,
-    session_campaign, -- [新增] 增加 campaign 分组
     
     -- 会话和用户
     COUNT(DISTINCT session_id) AS sessions,
@@ -244,20 +240,19 @@ Final_Aggregation AS (
       0
     ) AS total_revenue,
     
-    -- Bounced sessions (engaged = '0' or null)
+    -- Bounced sessions
     COUNT(DISTINCT CASE WHEN session_engaged_param != '1' OR session_engaged_param IS NULL THEN session_id END) AS bounced_sessions
   FROM
     Session_Channel_Mapped
   GROUP BY
-    channel, date, session_campaign
-  -- 只保留有转化的渠道 (可选，根据需求保留或移除)
+    channel, date
+  -- 只保留有转化的渠道 (根据需求，此处暂保留，如需查看所有流量可注释掉)
   HAVING total_conversions > 0
 )
 
--- 4. 最终输出
+-- 4. 最终输出 (不包含 Campaign)
 SELECT
   channel,
-  session_campaign AS campaign, -- 输出 campaign
   date,
   
   -- 基础指标
