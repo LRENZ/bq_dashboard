@@ -18,7 +18,7 @@ config {
 -- ============================================================================
 
 WITH 
--- 1. 获取原始流量表现
+-- 1. 获取原始流量表现 (包含跳出率)
 Raw_Performance AS (
   SELECT
     date,
@@ -26,7 +26,9 @@ Raw_Performance AS (
     conversion AS last_click_conversions,
     revenue AS last_click_revenue,
     session AS sessions,
-    users
+    users,
+    -- [新增] 获取跳出率
+    bounce_rate
   FROM
     ${ref('channel_performance')}
   WHERE
@@ -63,7 +65,7 @@ MTA_Weights AS (
     ${ref('mta_weights_complete')}
 ),
 
--- 4. 为每个渠道分配权重（缺失则为 0）
+-- 4. 为每个渠道分配权重
 Channel_With_Weights AS (
   SELECT
     rp.date,
@@ -72,6 +74,7 @@ Channel_With_Weights AS (
     rp.last_click_revenue,
     rp.sessions,
     rp.users,
+    rp.bounce_rate, -- [传递] 跳出率
     COALESCE(mw.mta_weight, 0) AS raw_weight,
     COALESCE(mw.original_markov_weight, 0) AS original_markov_weight,
     COALESCE(mw.removal_effect, 0) AS removal_effect,
@@ -96,7 +99,7 @@ Daily_Weight_Sums AS (
     date
 ),
 
--- 6. 归一化权重（确保每日权重总和 = 1）
+-- 6. 归一化权重
 Normalized_Weights AS (
   SELECT
     cw.date,
@@ -105,6 +108,7 @@ Normalized_Weights AS (
     cw.last_click_revenue,
     cw.sessions,
     cw.users,
+    cw.bounce_rate, -- [传递] 跳出率
     cw.raw_weight,
     cw.original_markov_weight,
     cw.removal_effect,
@@ -113,12 +117,10 @@ Normalized_Weights AS (
     cw.weight_source,
     dws.daily_weight_sum,
     
-    -- 归一化权重
     CASE
       WHEN dws.daily_weight_sum > 0 THEN
         SAFE_DIVIDE(cw.raw_weight, dws.daily_weight_sum)
       ELSE
-        -- 如果所有权重都是 0，平均分配
         SAFE_DIVIDE(1.0, COUNT(*) OVER (PARTITION BY cw.date))
     END AS normalized_weight
   FROM
@@ -128,7 +130,7 @@ Normalized_Weights AS (
     ON cw.date = dws.date
 ),
 
--- 7. 第一次计算 MTA（可能有小误差）
+-- 7. 第一次计算 MTA
 Initial_MTA_Calculation AS (
   SELECT
     nw.date,
@@ -137,6 +139,7 @@ Initial_MTA_Calculation AS (
     nw.last_click_revenue,
     nw.sessions,
     nw.users,
+    nw.bounce_rate, -- [传递] 跳出率
     nw.normalized_weight,
     nw.original_markov_weight,
     nw.removal_effect,
@@ -147,7 +150,6 @@ Initial_MTA_Calculation AS (
     dt.total_daily_conversions,
     dt.total_daily_revenue,
     
-    -- 初步计算 MTA
     dt.total_daily_conversions * nw.normalized_weight AS initial_mta_conversions,
     dt.total_daily_revenue * nw.normalized_weight AS initial_mta_revenue
   FROM
@@ -169,7 +171,7 @@ Initial_MTA_Sums AS (
     date
 ),
 
--- 9. 强制归一化（确保总和完全一致）
+-- 9. 强制归一化
 Final_MTA_Calculation AS (
   SELECT
     imc.date,
@@ -178,6 +180,7 @@ Final_MTA_Calculation AS (
     imc.last_click_revenue,
     imc.sessions,
     imc.users,
+    imc.bounce_rate, -- [传递] 跳出率
     imc.normalized_weight,
     imc.original_markov_weight,
     imc.removal_effect,
@@ -199,7 +202,6 @@ Final_MTA_Calculation AS (
           2
         )
       ELSE
-        -- 如果初步 MTA 总和为 0，平均分配
         ROUND(
           SAFE_DIVIDE(
             imc.total_daily_conversions,
@@ -220,7 +222,6 @@ Final_MTA_Calculation AS (
           2
         )
       ELSE
-        -- 如果初步 MTA 总和为 0，平均分配
         ROUND(
           SAFE_DIVIDE(
             imc.total_daily_revenue,
@@ -272,11 +273,15 @@ SELECT
     NULLIF(last_click_revenue, 0)
   ) AS revenue_uplift_rate,
   
-  -- ========== 效率指标 ==========
+  -- ========== 效率指标 (Performance) ==========
   SAFE_DIVIDE(last_click_conversions, sessions) AS last_click_conversion_rate,
   SAFE_DIVIDE(last_click_revenue, users) AS last_click_revenue_per_user,
   SAFE_DIVIDE(last_click_revenue, NULLIF(last_click_conversions, 0)) AS last_click_aov,
   
+  -- [新增] 质量指标
+  bounce_rate,
+  
+  -- ========== 效率指标 (MTA) ==========
   SAFE_DIVIDE(mta_conversions, sessions) AS mta_conversion_rate,
   SAFE_DIVIDE(mta_revenue, users) AS mta_revenue_per_user,
   SAFE_DIVIDE(mta_revenue, NULLIF(mta_conversions, 0)) AS mta_aov,
