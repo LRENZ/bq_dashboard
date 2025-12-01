@@ -83,11 +83,16 @@ Combined_Data AS (
     os.total_performance_revenue,
     
     CASE
-      WHEN mw.channel IS NOT NULL AND mw.markov_weight > 0.0001 THEN 'has_markov_weight'
+      -- 1. 明确被模型判定无效的
+      WHEN mw.channel IS NOT NULL AND COALESCE(mw.removal_effect, 0) = 0 THEN 'zero_removal_effect'
+      
+      -- 2. 正常的 Markov 权重
+      WHEN mw.channel IS NOT NULL AND mw.markov_weight > 0 THEN 'has_markov_weight'
+      
+      -- 3. Fallback 逻辑
       WHEN js.channel IS NOT NULL AND ps.channel IS NOT NULL THEN 'has_fallback_weight'
       WHEN js.channel IS NOT NULL AND ps.channel IS NULL THEN 'in_journey_only'
       WHEN ps.channel IS NOT NULL AND js.channel IS NULL THEN 'in_performance_only'
-      WHEN mw.channel IS NOT NULL AND mw.markov_weight <= 0.0001 THEN 'zero_markov_weight'
       ELSE 'unknown'
     END AS channel_category,
     
@@ -120,6 +125,7 @@ Calculated_Weights AS (
     SAFE_DIVIDE(performance_conversions, NULLIF(total_performance_conversions, 0)) AS perf_conv_share,
     SAFE_DIVIDE(performance_revenue, NULLIF(total_performance_revenue, 0)) AS perf_rev_share,
     
+    -- 计算兜底权重 (如果各项指标都是0，这里算出来就是0)
     COALESCE(SAFE_DIVIDE(journey_conversions, NULLIF(total_journey_conversions, 0)), 0) * 0.25 +
     COALESCE(SAFE_DIVIDE(journey_revenue, NULLIF(total_journey_revenue, 0)), 0) * 0.20 +
     COALESCE(SAFE_DIVIDE(performance_conversions, NULLIF(total_performance_conversions, 0)), 0) * 0.30 +
@@ -140,11 +146,17 @@ Final_Weights AS (
     channel_category,
     fallback_weight,
     
+    -- [关键修改] 不再强行给 0.0001
     CASE
+      -- 1. 被模型判定无效 -> 0
+      WHEN channel_category = 'zero_removal_effect' THEN 0
+      
+      -- 2. 有 Markov 权重 -> 使用 Markov
       WHEN channel_category = 'has_markov_weight' THEN markov_weight
-      WHEN channel_category IN ('has_fallback_weight', 'zero_markov_weight', 'in_journey_only', 'in_performance_only') THEN
-        GREATEST(fallback_weight, 0.0001)
-      ELSE 0.0001
+      
+      -- 3. 其他情况 -> 使用计算出的 fallback_weight
+      -- 如果 fallback_weight 是 0 (因为没转化)，那么 raw_weight 就是 0
+      ELSE COALESCE(fallback_weight, 0)
     END AS raw_weight,
     
     journey_conversions,
@@ -173,12 +185,16 @@ Normalized_Weights AS (
     fallback_weight,
     raw_weight,
     
-    SAFE_DIVIDE(raw_weight, SUM(raw_weight) OVER ()) AS normalized_weight,
+    -- 归一化：只要所有的 raw_weight 加起来大于0，就可以正常归一化
+    CASE 
+      WHEN SUM(raw_weight) OVER () > 0 THEN SAFE_DIVIDE(raw_weight, SUM(raw_weight) OVER ())
+      ELSE 0 -- 防止极端的除以0情况（理论上不可能，除非全网无转化）
+    END AS normalized_weight,
     
     CASE
       WHEN channel_category = 'has_markov_weight' THEN 'Markov Chain'
+      WHEN channel_category = 'zero_removal_effect' THEN 'Forced Zero (Zero Removal Effect)'
       WHEN channel_category = 'has_fallback_weight' THEN 'Fallback (Linear/Data Combined)'
-      WHEN channel_category = 'zero_markov_weight' THEN 'Fallback (Zero Markov)'
       WHEN channel_category = 'in_journey_only' THEN 'Fallback (Journey Only)'
       WHEN channel_category = 'in_performance_only' THEN 'Fallback (Performance Only)'
       ELSE 'Fallback (Unknown)'
@@ -226,6 +242,6 @@ SELECT
 FROM
   Normalized_Weights
 WHERE
-  normalized_weight > 0
+  normalized_weight >= 0 -- 保留 0 值行，以便查看哪些渠道没有权重
 ORDER BY
   normalized_weight DESC
