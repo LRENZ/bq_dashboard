@@ -12,9 +12,6 @@ config {
   tags: ["attribution", "ga4", "last-click"]
 }
 
--- ============================================================================
--- 渠道每日表现汇总表（Last Click Attribution）- 增量更新版
--- ============================================================================
 
 WITH 
 -- 1. 提取所有事件 (Raw Extraction)
@@ -60,26 +57,21 @@ Session_Raw AS (
     )}
 ),
 
--- 2. [新增] 预计算标记层 (Session_With_Flags)
--- 将付费流量判断逻辑统一，供后续逻辑调用
+-- 2. 预计算标记层 (Session_With_Flags)
 Session_With_Flags AS (
   SELECT
     *,
+    -- [核心修改] 付费流量判断逻辑
     CASE 
-      -- A. 强信号：Campaign 后缀 (最高优先级)
-      WHEN REGEXP_CONTAINS(session_campaign, r'-aw|-cs|-cv|-rt') THEN TRUE
+      -- A. 基于默认渠道组的强判定 (包含 Paid 或等于 Display)
+      WHEN REGEXP_CONTAINS(default_channel_group, r'Paid') THEN TRUE
+      WHEN default_channel_group = 'Display' THEN TRUE
       
-      -- B. 强信号：Source 特殊匹配
-      WHEN REGEXP_CONTAINS(session_source, r'capitaloneshopping') THEN TRUE
-      
-      -- C. 强信号：Medium 包含明确的付费标识
+      -- B. 基于 Medium 的技术判定 (标准付费媒介)
       WHEN REGEXP_CONTAINS(session_medium, r'^(cpc|ppc|display|cpm|banner)$') THEN TRUE
       WHEN session_medium LIKE '%paid%' THEN TRUE
       
-      -- D. 弱信号修正：Medium 为 'shopping' 或 'video' 时，必须结合 Channel Group 判断
-      WHEN session_medium IN ('video', 'shopping') 
-           AND default_channel_group IN ('Paid Shopping', 'Paid Video', 'Paid Search', 'Display') THEN TRUE
-           
+      -- 其他情况均为非付费
       ELSE FALSE
     END AS is_paid_traffic
   FROM Session_Raw
@@ -91,9 +83,8 @@ Session_Base_Mapped AS (
     *,
     
     CASE
-      -- [修正] Pillar Page 逻辑：必须同时满足 URL 规则 AND 是付费流量
+      -- Pillar Page 逻辑：必须同时满足 URL 规则 AND 是付费流量
       WHEN is_paid_traffic 
-           AND REGEXP_CONTAINS(session_campaign, r'-aw|-cs|-cv|-rt')
            AND REGEXP_CONTAINS(page_location, r'/pages/(what-is-an-ebike|cruiser-ebike|folding-ebike|city-ebike|fat-tire-ebike)')
       THEN 'pillar page'
 
@@ -173,7 +164,6 @@ Session_Base_Mapped AS (
         THEN 'paid other'
 
       WHEN REGEXP_CONTAINS(session_medium, r'ads|pr|paidreferral')
-        OR REGEXP_CONTAINS(session_source, r'capitaloneshopping')
         THEN 'paid referral'
 
       WHEN default_channel_group = 'Referral'
@@ -251,11 +241,9 @@ Final_Aggregation AS (
     Session_Final_Mapped
   GROUP BY
     channel, date
-   --- HAVING total_conversions > 0
 )
 
 -- 6. 最终输出计算 (Output Calculation)
--- 去掉了 HAVING total_conversions > 0，因为通常日报也需要看有流量但无转化的渠道数据
 SELECT
   channel,
   date,

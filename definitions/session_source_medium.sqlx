@@ -9,7 +9,7 @@ config {
 -- 多渠道归因数据准备 SQL
 -- ============================================================================
 
--- 1. 事件层数据提取 (提取原始字段并清洗 Source/Medium/Campaign)
+-- 1. 事件层数据提取
 WITH SessionEvents AS (
   WITH RawEvents AS (
     SELECT
@@ -61,28 +61,20 @@ WITH SessionEvents AS (
     RawEvents AS raw
 ),
 
--- 2. [新增] 预计算标记层 (EventsWithFlags)
--- 将付费流量的判断逻辑前置，以便 Pillar Page 逻辑可以调用
+-- 2. 预计算标记层 (EventsWithFlags)
 EventsWithFlags AS (
   SELECT
     *,
-    -- 修正后的付费流量判断逻辑
+    -- [核心修改] 付费流量判断逻辑
     CASE 
-      -- A. 强信号：Campaign 后缀 (最高优先级)
-      WHEN REGEXP_CONTAINS(campaign, r'-aw|-cs|-cv|-rt') THEN TRUE
+      -- A. 基于默认渠道组的强判定 (包含 Paid 或等于 Display)
+      WHEN REGEXP_CONTAINS(default_channel_group, r'Paid') THEN TRUE
+      WHEN default_channel_group = 'Display' THEN TRUE
       
-      -- B. 强信号：Source 特殊匹配
-      WHEN REGEXP_CONTAINS(source, r'capitaloneshopping') THEN TRUE
-      
-      -- C. 强信号：Medium 包含明确的付费标识 (cpc, ppc, display, cpm, banner, paidxxx)
+      -- B. 基于 Medium 的技术判定 (标准付费媒介)
       WHEN REGEXP_CONTAINS(medium, r'^(cpc|ppc|display|cpm|banner)$') THEN TRUE
       WHEN medium LIKE '%paid%' THEN TRUE
-      
-      -- D. 弱信号修正：Medium 为 'shopping' 或 'video' 时，必须结合 Channel Group 判断
-      -- 防止 medium='shopping' (可能是 organic) 被误判。只有当 Channel Group 明确为 Paid 时才算。
-      WHEN medium IN ('video', 'shopping') 
-           AND default_channel_group IN ('Paid Shopping', 'Paid Video', 'Paid Search', 'Display') THEN TRUE
-           
+
       ELSE FALSE
     END AS is_paid_traffic
   FROM SessionEvents
@@ -100,14 +92,12 @@ BaseTouchpoints AS (
     page_location,
     transaction_id,
     transaction_value,
-    is_paid_traffic, -- 传递预计算的标记
+    is_paid_traffic,
     
     -- 基础渠道分类逻辑
     CASE
-      -- [修正] Pillar Page 逻辑
-      -- 只有当流量被判定为 Paid (is_paid_traffic=TRUE) 且符合 Campaign/URL 规则时，才归为 Pillar Page
+      -- Pillar Page: 必须是付费流量 + 特定页面
       WHEN is_paid_traffic 
-           AND REGEXP_CONTAINS(campaign, r'-aw|-cs|-cv|-rt')
            AND REGEXP_CONTAINS(page_location, r'/pages/(what-is-an-ebike|cruiser-ebike|folding-ebike|city-ebike|fat-tire-ebike)')
       THEN 'pillar page'
 
@@ -187,7 +177,6 @@ BaseTouchpoints AS (
         THEN 'paid other'
 
       WHEN REGEXP_CONTAINS(medium, r'ads|pr|paidreferral')
-        OR REGEXP_CONTAINS(source, r'capitaloneshopping')
         THEN 'paid referral'
 
       WHEN default_channel_group = 'Referral'
