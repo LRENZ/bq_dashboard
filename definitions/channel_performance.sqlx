@@ -53,7 +53,7 @@ Session_Raw AS (
     -- 增量逻辑
     ${when(incremental(),
       `_TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1 DAY))`,
-      `_TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 90 DAY))`
+      `_TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 30 DAY))`
     )}
 ),
 
@@ -201,7 +201,7 @@ Session_Final_Mapped AS (
       
       WHEN is_initial_paid_flag 
            OR REGEXP_CONTAINS(base_channel, r'^paid') 
-           OR base_channel IN ('programmatic ads', 'connected tv', 'display', 'affiliates', 'kol') 
+           OR base_channel IN ('programmatic ads', 'connected tv', 'display', 'affiliates', 'kol','cross-network') 
       THEN
         CASE 
           WHEN CONTAINS_SUBSTR(session_campaign, '-aw') THEN base_channel || ':branding'
@@ -244,6 +244,7 @@ Final_Aggregation AS (
     Session_Final_Mapped
   GROUP BY
     channel, date
+    ---having total_conversions >0
 )
 
 -- 6. 最终输出计算 (Output Calculation)

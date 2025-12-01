@@ -6,34 +6,28 @@ config {
   tags: ["attribution", "mta", "complete"]
 }
 
-WITH
--- 1. 获取最新的 Markov 权重
-Latest_Markov_Weights AS (
+WITH Latest_Markov_Weights AS (
   SELECT
     channel,
     Weight AS markov_weight,
     Removal_Effect AS removal_effect,
-    Conversions AS markov_conversions,
-    Value AS markov_value,
-    run_date,
+    DATE(run_timestamp) AS run_date,
     run_timestamp
   FROM
     `bigquery-2024.attribution_v1.mta_attribution_v1_markov_details`
   WHERE
-    run_date = (
-      SELECT MAX(run_date) 
+    run_timestamp = (
+      SELECT MAX(run_timestamp) 
       FROM `bigquery-2024.attribution_v1.mta_attribution_v1_markov_details`
     )
 ),
 
--- 2. 合并所有唯一渠道
 All_Unique_Channels AS (
   SELECT DISTINCT channel FROM `bigquery-2024.attribution.session_source_medium`
   UNION DISTINCT
   SELECT DISTINCT channel FROM `bigquery-2024.attribution.channel_performance`
 ),
 
--- 3. 计算旅程统计
 Journey_Stats AS (
   SELECT
     channel,
@@ -46,7 +40,6 @@ Journey_Stats AS (
     channel
 ),
 
--- 4. 计算表现统计
 Performance_Stats AS (
   SELECT
     channel,
@@ -60,7 +53,6 @@ Performance_Stats AS (
     channel
 ),
 
--- 5. 计算总体统计
 Overall_Stats AS (
   SELECT
     COALESCE(SUM(js.journey_conversions), 0) AS total_journey_conversions,
@@ -73,7 +65,6 @@ Overall_Stats AS (
   LEFT JOIN Performance_Stats ps ON auc.channel = ps.channel
 ),
 
--- 6. 合并所有数据
 Combined_Data AS (
   SELECT
     auc.channel,
@@ -90,13 +81,16 @@ Combined_Data AS (
     os.total_journey_revenue,
     os.total_performance_conversions,
     os.total_performance_revenue,
+    
     CASE
       WHEN mw.channel IS NOT NULL AND mw.markov_weight > 0.0001 THEN 'has_markov_weight'
+      WHEN js.channel IS NOT NULL AND ps.channel IS NOT NULL THEN 'has_fallback_weight'
+      WHEN js.channel IS NOT NULL AND ps.channel IS NULL THEN 'in_journey_only'
+      WHEN ps.channel IS NOT NULL AND js.channel IS NULL THEN 'in_performance_only'
       WHEN mw.channel IS NOT NULL AND mw.markov_weight <= 0.0001 THEN 'zero_markov_weight'
-      WHEN js.channel IS NOT NULL THEN 'in_journey_only'
-      WHEN ps.channel IS NOT NULL THEN 'in_performance_only'
       ELSE 'unknown'
     END AS channel_category,
+    
     mw.run_date,
     mw.run_timestamp
   FROM
@@ -107,7 +101,6 @@ Combined_Data AS (
   CROSS JOIN Overall_Stats os
 ),
 
--- 7. 计算后备权重
 Calculated_Weights AS (
   SELECT
     channel,
@@ -122,13 +115,11 @@ Calculated_Weights AS (
     performance_sessions,
     performance_users,
     
-    -- 计算各维度占比
     SAFE_DIVIDE(journey_conversions, NULLIF(total_journey_conversions, 0)) AS journey_conv_share,
     SAFE_DIVIDE(journey_revenue, NULLIF(total_journey_revenue, 0)) AS journey_rev_share,
     SAFE_DIVIDE(performance_conversions, NULLIF(total_performance_conversions, 0)) AS perf_conv_share,
     SAFE_DIVIDE(performance_revenue, NULLIF(total_performance_revenue, 0)) AS perf_rev_share,
     
-    -- 计算后备权重
     COALESCE(SAFE_DIVIDE(journey_conversions, NULLIF(total_journey_conversions, 0)), 0) * 0.25 +
     COALESCE(SAFE_DIVIDE(journey_revenue, NULLIF(total_journey_revenue, 0)), 0) * 0.20 +
     COALESCE(SAFE_DIVIDE(performance_conversions, NULLIF(total_performance_conversions, 0)), 0) * 0.30 +
@@ -141,7 +132,6 @@ Calculated_Weights AS (
     Combined_Data
 ),
 
--- 8. 确定最终权重
 Final_Weights AS (
   SELECT
     channel,
@@ -150,10 +140,9 @@ Final_Weights AS (
     channel_category,
     fallback_weight,
     
-    -- 最终权重逻辑
     CASE
       WHEN channel_category = 'has_markov_weight' THEN markov_weight
-      WHEN channel_category IN ('zero_markov_weight', 'in_journey_only', 'in_performance_only') THEN
+      WHEN channel_category IN ('has_fallback_weight', 'zero_markov_weight', 'in_journey_only', 'in_performance_only') THEN
         GREATEST(fallback_weight, 0.0001)
       ELSE 0.0001
     END AS raw_weight,
@@ -175,7 +164,6 @@ Final_Weights AS (
     Calculated_Weights
 ),
 
--- 9. 归一化权重
 Normalized_Weights AS (
   SELECT
     channel,
@@ -185,12 +173,11 @@ Normalized_Weights AS (
     fallback_weight,
     raw_weight,
     
-    -- 归一化
     SAFE_DIVIDE(raw_weight, SUM(raw_weight) OVER ()) AS normalized_weight,
     
-    -- 权重来源
     CASE
       WHEN channel_category = 'has_markov_weight' THEN 'Markov Chain'
+      WHEN channel_category = 'has_fallback_weight' THEN 'Fallback (Linear/Data Combined)'
       WHEN channel_category = 'zero_markov_weight' THEN 'Fallback (Zero Markov)'
       WHEN channel_category = 'in_journey_only' THEN 'Fallback (Journey Only)'
       WHEN channel_category = 'in_performance_only' THEN 'Fallback (Performance Only)'
@@ -214,7 +201,6 @@ Normalized_Weights AS (
     Final_Weights
 )
 
--- 10. 最终输出
 SELECT
   channel,
   normalized_weight AS Weight,

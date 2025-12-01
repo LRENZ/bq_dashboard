@@ -213,7 +213,7 @@ AllTouchpoints AS (
     -- 逻辑：如果 base_channel 名字以 "paid" 开头，或者属于特定的付费类型，强制标记为 TRUE
     CASE 
       WHEN REGEXP_CONTAINS(base_channel, r'^paid') THEN TRUE
-      WHEN base_channel IN ('programmatic ads', 'connected tv', 'display', 'affiliates', 'kol') THEN TRUE
+      WHEN base_channel IN ('programmatic ads', 'connected tv', 'display', 'affiliates', 'kol','cross-network') THEN TRUE
       WHEN is_initial_paid_flag THEN TRUE
       ELSE FALSE
     END AS is_paid_traffic,
