@@ -206,7 +206,8 @@ Session_Final_Mapped AS (
           WHEN CONTAINS_SUBSTR(session_campaign, '-cs') THEN base_channel || ':traffic'
           WHEN CONTAINS_SUBSTR(session_campaign, '-cv') THEN base_channel || ':conversion'
           WHEN CONTAINS_SUBSTR(session_campaign, '-rt') THEN base_channel || ':retargeting'
-          ELSE base_channel
+          -- 修改：无上述后缀，默认为 conversion
+          ELSE base_channel || ':conversion'
         END
       ELSE base_channel 
     END AS channel
