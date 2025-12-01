@@ -226,10 +226,10 @@ AllTouchpoints AS (
       -- 只要满足以下任一条件，必须进入后缀拆分流程：
       -- 1. 初始标记是 Paid
       -- 2. 计算出的渠道名以 'paid' 开头 (这就捕获了 paid referral, paid social 等)
-      -- 3. 属于特定付费列表
+      -- 3. 属于特定付费列表 (在此处加入了 cross-network)
       WHEN is_initial_paid_flag 
            OR REGEXP_CONTAINS(base_channel, r'^paid') 
-           OR base_channel IN ('programmatic ads', 'connected tv', 'display', 'affiliates', 'kol') 
+           OR base_channel IN ('programmatic ads', 'connected tv', 'display', 'affiliates', 'kol', 'cross-network') 
       THEN
         CASE 
           WHEN CONTAINS_SUBSTR(campaign, '-aw') THEN base_channel || ':branding'

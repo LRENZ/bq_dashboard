@@ -23,8 +23,7 @@ Session_Raw AS (
     
     DATE(TIMESTAMP_MICROS(event_timestamp), "America/Los_Angeles") AS date,
     
-    -- [核心修复] 计算整个会话是否为 Engaged
-    -- 我们查看该 Session ID 下的所有事件，只要有一个事件的 session_engaged = '1'，则该会话为 Engaged
+    -- 计算整个会话是否为 Engaged
     MAX(
       CASE 
         WHEN (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'session_engaged') = '1' THEN 1 
@@ -201,14 +200,16 @@ Session_Final_Mapped AS (
     event_name,
     transaction_id,
     purchase_revenue_in_usd,
-    is_session_engaged, -- 传递正确计算的 engagement 标记
+    is_session_engaged,
     
     -- 后缀拆分逻辑
     CASE 
       WHEN base_channel IN ('pillar page', 'email', 'sms') THEN base_channel
       
+      -- 只要满足以下任一条件，必须进入后缀拆分流程：
       WHEN is_initial_paid_flag 
            OR REGEXP_CONTAINS(base_channel, r'^paid') 
+           -- 【修复点】在这里加入了 'cross-network'
            OR base_channel IN ('programmatic ads', 'connected tv', 'display', 'affiliates', 'kol', 'cross-network') 
       THEN
         CASE 
