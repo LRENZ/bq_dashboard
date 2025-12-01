@@ -9,7 +9,7 @@ config {
 -- 多渠道归因数据准备 SQL
 -- ============================================================================
 
--- 1. 事件层数据提取
+-- 1. 事件层数据提取 (提取原始字段并清洗 Source/Medium/Campaign)
 WITH SessionEvents AS (
   WITH RawEvents AS (
     SELECT
@@ -61,7 +61,34 @@ WITH SessionEvents AS (
     RawEvents AS raw
 ),
 
--- 2. 基础渠道映射 (BaseTouchpoints)
+-- 2. [新增] 预计算标记层 (EventsWithFlags)
+-- 将付费流量的判断逻辑前置，以便 Pillar Page 逻辑可以调用
+EventsWithFlags AS (
+  SELECT
+    *,
+    -- 修正后的付费流量判断逻辑
+    CASE 
+      -- A. 强信号：Campaign 后缀 (最高优先级)
+      WHEN REGEXP_CONTAINS(campaign, r'-aw|-cs|-cv|-rt') THEN TRUE
+      
+      -- B. 强信号：Source 特殊匹配
+      WHEN REGEXP_CONTAINS(source, r'capitaloneshopping') THEN TRUE
+      
+      -- C. 强信号：Medium 包含明确的付费标识 (cpc, ppc, display, cpm, banner, paidxxx)
+      WHEN REGEXP_CONTAINS(medium, r'^(cpc|ppc|display|cpm|banner)$') THEN TRUE
+      WHEN medium LIKE '%paid%' THEN TRUE
+      
+      -- D. 弱信号修正：Medium 为 'shopping' 或 'video' 时，必须结合 Channel Group 判断
+      -- 防止 medium='shopping' (可能是 organic) 被误判。只有当 Channel Group 明确为 Paid 时才算。
+      WHEN medium IN ('video', 'shopping') 
+           AND default_channel_group IN ('Paid Shopping', 'Paid Video', 'Paid Search', 'Display') THEN TRUE
+           
+      ELSE FALSE
+    END AS is_paid_traffic
+  FROM SessionEvents
+),
+
+-- 3. 基础渠道映射 (BaseTouchpoints)
 BaseTouchpoints AS (
   SELECT
     unified_user_id,
@@ -73,11 +100,14 @@ BaseTouchpoints AS (
     page_location,
     transaction_id,
     transaction_value,
+    is_paid_traffic, -- 传递预计算的标记
     
     -- 基础渠道分类逻辑
     CASE
-      -- Pillar Page 优先级最高
-      WHEN REGEXP_CONTAINS(campaign, r'-aw|-cs|-cv|-rt')
+      -- [修正] Pillar Page 逻辑
+      -- 只有当流量被判定为 Paid (is_paid_traffic=TRUE) 且符合 Campaign/URL 规则时，才归为 Pillar Page
+      WHEN is_paid_traffic 
+           AND REGEXP_CONTAINS(campaign, r'-aw|-cs|-cv|-rt')
            AND REGEXP_CONTAINS(page_location, r'/pages/(what-is-an-ebike|cruiser-ebike|folding-ebike|city-ebike|fat-tire-ebike)')
       THEN 'pillar page'
 
@@ -175,23 +205,13 @@ BaseTouchpoints AS (
         THEN 'connected tv'
 
       ELSE 'unassigned'
-    END AS base_channel,
-    
-    -- 是否付费流量标识
-    CASE 
-      WHEN REGEXP_CONTAINS(campaign, r'-aw|-cs|-cv|-rt') THEN TRUE
-      WHEN medium LIKE '%cpc%' 
-        OR medium LIKE '%paid%'
-        OR medium IN ('ppc', 'display', 'cpm', 'banner', 'video', 'shopping')
-        OR REGEXP_CONTAINS(source, r'capitaloneshopping') 
-        THEN TRUE
-      ELSE FALSE
-    END AS is_paid_traffic
+    END AS base_channel
+
   FROM
-    SessionEvents
+    EventsWithFlags
 ),
 
--- 3. [修改] 最终渠道逻辑 (AllTouchpoints)
+-- 4. 最终渠道逻辑 (AllTouchpoints)
 AllTouchpoints AS (
   SELECT
     unified_user_id,
@@ -204,12 +224,9 @@ AllTouchpoints AS (
     transaction_value,
     is_paid_traffic,
     
-    -- [关键修改]：Pillar Page 和 Email 不进行后缀拆分
+    -- 后缀拆分逻辑 (Pillar Page 和 Email 除外)
     CASE 
-      -- 如果是 Pillar Page 或 Email，直接返回基础渠道名，忽略后缀
       WHEN base_channel IN ('pillar page', 'email') THEN base_channel
-
-      -- 如果是其他付费流量，根据后缀拆分
       WHEN is_paid_traffic THEN
         CASE 
           WHEN CONTAINS_SUBSTR(campaign, '-aw') THEN base_channel || ':branding'
@@ -218,15 +235,13 @@ AllTouchpoints AS (
           WHEN CONTAINS_SUBSTR(campaign, '-rt') THEN base_channel || ':retargeting'
           ELSE base_channel
         END
-      
-      -- 非付费流量
       ELSE base_channel 
     END AS channel
 
   FROM BaseTouchpoints
 ),
 
--- 4. 识别购买事件
+-- 5. 识别购买事件
 PurchaseEvents AS (
   SELECT
     unified_user_id,
@@ -247,7 +262,7 @@ PurchaseEvents AS (
         DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 30 DAY)
 ),
 
--- 5. 构建用户购买旅程路径
+-- 6. 构建用户购买旅程路径
 TransactionJourneys AS (
   SELECT
     p.unified_user_id,
@@ -279,7 +294,7 @@ TransactionJourneys AS (
     1, 2, 3, 4
 ),
 
--- 6. 展开路径为行级数据
+-- 7. 展开路径为行级数据
 ExpandedPath AS (
   SELECT
     t.unified_user_id,
@@ -299,7 +314,7 @@ ExpandedPath AS (
     UNNEST(t.touchpoint_path) AS touchpoint
 ),
 
--- 7. 标记购买事件并去重连续相同渠道
+-- 8. 标记购买事件并去重连续相同渠道
 PathWithTransactions AS (
   SELECT
     unified_user_id,
@@ -326,7 +341,7 @@ PathWithTransactions AS (
     ExpandedPath
 ),
 
--- 8. 最终输出过滤
+-- 9. 最终输出过滤
 FinalOutput AS (
   SELECT
     unified_user_id,

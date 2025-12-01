@@ -17,7 +17,7 @@ config {
 -- ============================================================================
 
 WITH 
--- 1. 提取所有事件
+-- 1. 提取所有事件 (Raw Extraction)
 Session_Raw AS (
   SELECT
     user_pseudo_id,
@@ -53,21 +53,47 @@ Session_Raw AS (
   FROM
     ${ref('analytics_489554557', 'events_*')}
   WHERE
-    -- 注意：对于 events_* 表，我们需要过滤 _TABLE_SUFFIX
+    -- 增量逻辑
     ${when(incremental(),
       `_TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1 DAY))`,
       `_TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 90 DAY))`
     )}
 ),
 
--- 2. 基础渠道映射 (Base Mapping)
+-- 2. [新增] 预计算标记层 (Session_With_Flags)
+-- 将付费流量判断逻辑统一，供后续逻辑调用
+Session_With_Flags AS (
+  SELECT
+    *,
+    CASE 
+      -- A. 强信号：Campaign 后缀 (最高优先级)
+      WHEN REGEXP_CONTAINS(session_campaign, r'-aw|-cs|-cv|-rt') THEN TRUE
+      
+      -- B. 强信号：Source 特殊匹配
+      WHEN REGEXP_CONTAINS(session_source, r'capitaloneshopping') THEN TRUE
+      
+      -- C. 强信号：Medium 包含明确的付费标识
+      WHEN REGEXP_CONTAINS(session_medium, r'^(cpc|ppc|display|cpm|banner)$') THEN TRUE
+      WHEN session_medium LIKE '%paid%' THEN TRUE
+      
+      -- D. 弱信号修正：Medium 为 'shopping' 或 'video' 时，必须结合 Channel Group 判断
+      WHEN session_medium IN ('video', 'shopping') 
+           AND default_channel_group IN ('Paid Shopping', 'Paid Video', 'Paid Search', 'Display') THEN TRUE
+           
+      ELSE FALSE
+    END AS is_paid_traffic
+  FROM Session_Raw
+),
+
+-- 3. 基础渠道映射 (Base Mapping)
 Session_Base_Mapped AS (
   SELECT
     *,
     
     CASE
-      -- Pillar Page 优先级最高
-      WHEN REGEXP_CONTAINS(session_campaign, r'-aw|-cs|-cv|-rt')
+      -- [修正] Pillar Page 逻辑：必须同时满足 URL 规则 AND 是付费流量
+      WHEN is_paid_traffic 
+           AND REGEXP_CONTAINS(session_campaign, r'-aw|-cs|-cv|-rt')
            AND REGEXP_CONTAINS(page_location, r'/pages/(what-is-an-ebike|cruiser-ebike|folding-ebike|city-ebike|fat-tire-ebike)')
       THEN 'pillar page'
 
@@ -165,23 +191,12 @@ Session_Base_Mapped AS (
         THEN 'connected tv'
 
       ELSE 'unassigned'
-    END AS base_channel,
-    
-    -- 是否付费流量标识
-    CASE 
-      WHEN REGEXP_CONTAINS(session_campaign, r'-aw|-cs|-cv|-rt') THEN TRUE
-      WHEN session_medium LIKE '%cpc%' 
-        OR session_medium LIKE '%paid%'
-        OR session_medium IN ('ppc', 'display', 'cpm', 'banner', 'video', 'shopping')
-        OR REGEXP_CONTAINS(session_source, r'capitaloneshopping') 
-        THEN TRUE
-      ELSE FALSE
-    END AS is_paid_traffic
+    END AS base_channel
   FROM
-    Session_Raw
+    Session_With_Flags
 ),
 
--- 3. 最终渠道逻辑 (Final Mapping)
+-- 4. 最终渠道逻辑 (Final Mapping)
 Session_Final_Mapped AS (
   SELECT
     date,
@@ -192,12 +207,9 @@ Session_Final_Mapped AS (
     purchase_revenue_in_usd,
     session_engaged_param,
     
-    -- [逻辑保持不变]：Pillar Page 和 Email 不进行后缀拆分
+    -- 后缀拆分逻辑 (Pillar Page 和 Email 除外)
     CASE 
-      -- 如果是 Pillar Page 或 Email，直接返回基础渠道名
       WHEN base_channel IN ('pillar page', 'email') THEN base_channel
-
-      -- 如果是其他付费流量，根据后缀拆分
       WHEN is_paid_traffic THEN
         CASE 
           WHEN CONTAINS_SUBSTR(session_campaign, '-aw') THEN base_channel || ':branding'
@@ -206,15 +218,13 @@ Session_Final_Mapped AS (
           WHEN CONTAINS_SUBSTR(session_campaign, '-rt') THEN base_channel || ':retargeting'
           ELSE base_channel
         END
-      
-      -- 其他情况
       ELSE base_channel 
     END AS channel
   FROM 
     Session_Base_Mapped
 ),
 
--- 4. 最终聚合
+-- 5. 最终聚合 (Final Aggregation)
 Final_Aggregation AS (
   SELECT
     channel,
@@ -241,10 +251,11 @@ Final_Aggregation AS (
     Session_Final_Mapped
   GROUP BY
     channel, date
-  HAVING total_conversions > 0
+   --- HAVING total_conversions > 0
 )
 
--- 5. 最终输出
+-- 6. 最终输出计算 (Output Calculation)
+-- 去掉了 HAVING total_conversions > 0，因为通常日报也需要看有流量但无转化的渠道数据
 SELECT
   channel,
   date,
