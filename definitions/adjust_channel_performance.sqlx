@@ -32,7 +32,7 @@ Raw_Performance AS (
   WHERE
     ${when(
       incremental(),
-      `date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 7 DAY)`,
+      `date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1 DAY)`,
       `date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 90 DAY)`
     )}
 ),

@@ -19,7 +19,7 @@ WITH SessionEvents AS (
       ${ref('analytics_489554557', 'events_*')}
     WHERE
       event_name IN ('purchase', 'session_start', 'first_visit', 'page_view')
-      AND _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY))
+      AND _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY))
                              AND FORMAT_DATE('%Y%m%d', CURRENT_DATE())
   )
   SELECT
