@@ -18,9 +18,19 @@ WITH
 Session_Raw AS (
   SELECT
     user_pseudo_id,
+    -- 获取 session_id
     (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS session_id,
+    
     DATE(TIMESTAMP_MICROS(event_timestamp), "America/Los_Angeles") AS date,
-    (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'session_engaged') AS session_engaged_param,
+    
+    -- [核心修复] 计算整个会话是否为 Engaged
+    -- 我们查看该 Session ID 下的所有事件，只要有一个事件的 session_engaged = '1'，则该会话为 Engaged
+    MAX(
+      CASE 
+        WHEN (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'session_engaged') = '1' THEN 1 
+        ELSE 0 
+      END
+    ) OVER (PARTITION BY user_pseudo_id, (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id')) AS is_session_engaged,
     
     session_traffic_source_last_click.cross_channel_campaign.default_channel_group AS default_channel_group,
 
@@ -53,7 +63,7 @@ Session_Raw AS (
     -- 增量逻辑
     ${when(incremental(),
       `_TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1 DAY))`,
-      `_TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 30 DAY))`
+      `_TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 90 DAY))`
     )}
 ),
 
@@ -182,7 +192,7 @@ Session_Base_Mapped AS (
     Session_With_Flags
 ),
 
--- 4. 最终渠道逻辑 (Final Mapping) - 核心修正
+-- 4. 最终渠道逻辑 (Final Mapping)
 Session_Final_Mapped AS (
   SELECT
     date,
@@ -191,17 +201,15 @@ Session_Final_Mapped AS (
     event_name,
     transaction_id,
     purchase_revenue_in_usd,
-    session_engaged_param,
+    is_session_engaged, -- 传递正确计算的 engagement 标记
     
-    -- [逻辑加强]
-    -- 1. 排除 pillar page, email, sms
-    -- 2. 如果 初始标记为 Paid OR 渠道名以 'paid' 开头 OR 属于特定付费类型 -> 强制进入后缀逻辑
+    -- 后缀拆分逻辑
     CASE 
       WHEN base_channel IN ('pillar page', 'email', 'sms') THEN base_channel
       
       WHEN is_initial_paid_flag 
            OR REGEXP_CONTAINS(base_channel, r'^paid') 
-           OR base_channel IN ('programmatic ads', 'connected tv', 'display', 'affiliates', 'kol','cross-network') 
+           OR base_channel IN ('programmatic ads', 'connected tv', 'display', 'affiliates', 'kol', 'cross-network') 
       THEN
         CASE 
           WHEN CONTAINS_SUBSTR(session_campaign, '-aw') THEN base_channel || ':branding'
@@ -239,12 +247,14 @@ Final_Aggregation AS (
       0
     ) AS total_revenue,
     
-    COUNT(DISTINCT CASE WHEN session_engaged_param != '1' OR session_engaged_param IS NULL THEN session_id END) AS bounced_sessions
+    -- [修正] 计算跳出数
+    -- 跳出 = 总 Sessions - Engaged Sessions
+    -- 如果 is_session_engaged = 1，则不是跳出；如果是 0，则是跳出
+    COUNT(DISTINCT CASE WHEN is_session_engaged = 0 THEN session_id END) AS bounced_sessions
   FROM
     Session_Final_Mapped
   GROUP BY
     channel, date
-    ---having total_conversions >0
 )
 
 -- 6. 最终输出计算 (Output Calculation)
