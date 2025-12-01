@@ -65,18 +65,14 @@ WITH SessionEvents AS (
 EventsWithFlags AS (
   SELECT
     *,
-    -- [核心修改] 付费流量判断逻辑
+    -- 初始判定：主要用于辅助判断 Pillar Page
     CASE 
-      -- A. 基于默认渠道组的强判定 (包含 Paid 或等于 Display)
       WHEN REGEXP_CONTAINS(default_channel_group, r'Paid') THEN TRUE
       WHEN default_channel_group = 'Display' THEN TRUE
-      
-      -- B. 基于 Medium 的技术判定 (标准付费媒介)
       WHEN REGEXP_CONTAINS(medium, r'^(cpc|ppc|display|cpm|banner)$') THEN TRUE
       WHEN medium LIKE '%paid%' THEN TRUE
-
       ELSE FALSE
-    END AS is_paid_traffic
+    END AS is_initial_paid_flag
   FROM SessionEvents
 ),
 
@@ -92,12 +88,12 @@ BaseTouchpoints AS (
     page_location,
     transaction_id,
     transaction_value,
-    is_paid_traffic,
+    is_initial_paid_flag, -- 保留原始标记
     
     -- 基础渠道分类逻辑
     CASE
-      -- Pillar Page: 必须是付费流量 + 特定页面
-      WHEN is_paid_traffic 
+      -- Pillar Page: 必须是初始判定为付费 + 特定页面
+      WHEN is_initial_paid_flag 
            AND REGEXP_CONTAINS(page_location, r'/pages/(what-is-an-ebike|cruiser-ebike|folding-ebike|city-ebike|fat-tire-ebike)')
       THEN 'pillar page'
 
@@ -200,7 +196,7 @@ BaseTouchpoints AS (
     EventsWithFlags
 ),
 
--- 4. 最终渠道逻辑 (AllTouchpoints)
+-- 4. 最终渠道逻辑 (AllTouchpoints) - 核心修改发生在这里
 AllTouchpoints AS (
   SELECT
     unified_user_id,
@@ -211,18 +207,30 @@ AllTouchpoints AS (
     campaign,
     transaction_id,
     transaction_value,
-    is_paid_traffic,
     
-    -- 后缀拆分逻辑 (Pillar Page 和 Email 除外)
+    -- [修正] 最终的 is_paid_traffic 状态
+    -- 如果原始标记是 true，或者 Base Channel 名字里包含 'paid'，或者属于程序化广告/Connected TV，则强制为 True
+    CASE 
+      WHEN is_initial_paid_flag THEN TRUE
+      WHEN REGEXP_CONTAINS(base_channel, r'^paid') THEN TRUE
+      WHEN base_channel IN ('programmatic ads', 'connected tv', 'display') THEN TRUE
+      ELSE FALSE
+    END AS is_paid_traffic,
+    
+    -- 后缀拆分逻辑
     CASE 
       WHEN base_channel IN ('pillar page', 'email') THEN base_channel
-      WHEN is_paid_traffic THEN
+      -- [修正] 使用判定后的逻辑：只要是 Paid 或者是上述强制转换的渠道，都进行拆分
+      WHEN is_initial_paid_flag 
+           OR REGEXP_CONTAINS(base_channel, r'^paid') 
+           OR base_channel IN ('programmatic ads', 'connected tv', 'display') 
+      THEN
         CASE 
           WHEN CONTAINS_SUBSTR(campaign, '-aw') THEN base_channel || ':branding'
           WHEN CONTAINS_SUBSTR(campaign, '-cs') THEN base_channel || ':traffic'
           WHEN CONTAINS_SUBSTR(campaign, '-cv') THEN base_channel || ':conversion'
           WHEN CONTAINS_SUBSTR(campaign, '-rt') THEN base_channel || ':retargeting'
-          -- 修改：无上述后缀，默认为 conversion
+          -- 默认为 conversion
           ELSE base_channel || ':conversion'
         END
       ELSE base_channel 
