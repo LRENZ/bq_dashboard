@@ -61,7 +61,7 @@ Session_Raw AS (
 Session_With_Flags AS (
   SELECT
     *,
-    -- 初始付费标记
+    -- 初始技术标记
     CASE 
       WHEN REGEXP_CONTAINS(default_channel_group, r'Paid') THEN TRUE
       WHEN default_channel_group = 'Display' THEN TRUE
@@ -158,6 +158,7 @@ Session_Base_Mapped AS (
       WHEN default_channel_group = 'Paid Other'
         THEN 'paid other'
 
+      -- [注意] 这里将 ads, pr 定义为 paid referral
       WHEN REGEXP_CONTAINS(session_medium, r'ads|pr|paidreferral')
         THEN 'paid referral'
 
@@ -181,7 +182,7 @@ Session_Base_Mapped AS (
     Session_With_Flags
 ),
 
--- 4. 最终渠道逻辑 (Final Mapping)
+-- 4. 最终渠道逻辑 (Final Mapping) - 核心修正
 Session_Final_Mapped AS (
   SELECT
     date,
@@ -192,15 +193,15 @@ Session_Final_Mapped AS (
     purchase_revenue_in_usd,
     session_engaged_param,
     
-    -- [核心修改] 
-    -- 1. 如果 Base Channel 名字包含 paid，强制进入后缀拆分逻辑
-    -- 2. 如果无后缀，默认为 conversion
+    -- [逻辑加强]
+    -- 1. 排除 pillar page, email, sms
+    -- 2. 如果 初始标记为 Paid OR 渠道名以 'paid' 开头 OR 属于特定付费类型 -> 强制进入后缀逻辑
     CASE 
-      WHEN base_channel IN ('pillar page', 'email') THEN base_channel
-      -- 只要是原始标记为 Paid，或者计算出的渠道名以 paid 开头，或者特定付费渠道
+      WHEN base_channel IN ('pillar page', 'email', 'sms') THEN base_channel
+      
       WHEN is_initial_paid_flag 
            OR REGEXP_CONTAINS(base_channel, r'^paid') 
-           OR base_channel IN ('programmatic ads', 'connected tv', 'display') 
+           OR base_channel IN ('programmatic ads', 'connected tv', 'display', 'affiliates', 'kol') 
       THEN
         CASE 
           WHEN CONTAINS_SUBSTR(session_campaign, '-aw') THEN base_channel || ':branding'
@@ -209,6 +210,7 @@ Session_Final_Mapped AS (
           WHEN CONTAINS_SUBSTR(session_campaign, '-rt') THEN base_channel || ':retargeting'
           ELSE base_channel || ':conversion'
         END
+      
       ELSE base_channel 
     END AS channel
   FROM 
