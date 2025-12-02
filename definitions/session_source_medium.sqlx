@@ -221,7 +221,7 @@ AllTouchpoints AS (
     -- [修正 2] 强制应用后缀逻辑
     CASE 
       -- 排除不需要后缀的特定渠道
-      WHEN base_channel IN ('pillar page', 'email', 'sms') THEN base_channel
+      WHEN base_channel IN ('pillar page', 'email', 'sms','unassigned') THEN base_channel
       
       -- 只要满足以下任一条件，必须进入后缀拆分流程：
       -- 1. 初始标记是 Paid

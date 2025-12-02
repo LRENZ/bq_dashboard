@@ -204,7 +204,7 @@ Session_Final_Mapped AS (
     
     -- 后缀拆分逻辑
     CASE 
-      WHEN base_channel IN ('pillar page', 'email', 'sms') THEN base_channel
+      WHEN base_channel IN ('pillar page', 'email', 'sms','unassigned') THEN base_channel
       
       -- 只要满足以下任一条件，必须进入后缀拆分流程：
       WHEN is_initial_paid_flag 
