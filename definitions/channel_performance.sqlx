@@ -185,11 +185,11 @@ Session_Final_Mapped AS (
     is_session_engaged,
     
     CASE 
-      WHEN base_channel IN ('pillar page', 'email', 'sms', 'affiliates', 'unassigned') THEN base_channel
+      WHEN base_channel IN ('pillar page', 'email', 'sms', 'affiliates', 'unassigned','kol') THEN base_channel
       
       WHEN is_initial_paid_flag 
            OR REGEXP_CONTAINS(base_channel, r'^paid') 
-           OR base_channel IN ('programmatic ads', 'connected tv', 'display', 'kol', 'cross-network') 
+           OR base_channel IN ('programmatic ads', 'connected tv', 'display', 'cross-network') 
       THEN
         CASE 
           WHEN CONTAINS_SUBSTR(session_campaign, '-aw') THEN base_channel || ':branding'
