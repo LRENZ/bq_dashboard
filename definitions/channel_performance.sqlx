@@ -13,17 +13,11 @@ config {
 }
 
 
-WITH 
--- 1. 提取所有事件 (Raw Extraction)
-Session_Raw AS (
+WITH Session_Raw AS (
   SELECT
     user_pseudo_id,
-    -- 获取 session_id
     (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS session_id,
-    
     DATE(TIMESTAMP_MICROS(event_timestamp), "America/Los_Angeles") AS date,
-    
-    -- 计算整个会话是否为 Engaged
     MAX(
       CASE 
         WHEN (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'session_engaged') = '1' THEN 1 
@@ -57,20 +51,14 @@ Session_Raw AS (
     ecommerce.transaction_id,
     COALESCE(ecommerce.purchase_revenue_in_usd, 0) AS purchase_revenue_in_usd
   FROM
-    ${ref('analytics_489554557', 'events_*')}
+    `bigquery-2024.analytics_489554557.events_*`
   WHERE
-    -- 增量逻辑
-    ${when(incremental(),
-      `_TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1 DAY))`,
-      `_TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 90 DAY))`
-    )}
+    _TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 90 DAY))
 ),
 
--- 2. 预计算标记层 (Session_With_Flags)
 Session_With_Flags AS (
   SELECT
     *,
-    -- 初始技术标记
     CASE 
       WHEN REGEXP_CONTAINS(default_channel_group, r'Paid') THEN TRUE
       WHEN default_channel_group = 'Display' THEN TRUE
@@ -81,18 +69,14 @@ Session_With_Flags AS (
   FROM Session_Raw
 ),
 
--- 3. 基础渠道映射 (Base Mapping)
 Session_Base_Mapped AS (
   SELECT
     *,
-    
     CASE
-      -- Pillar Page 逻辑
       WHEN is_initial_paid_flag 
            AND REGEXP_CONTAINS(page_location, r'/pages/(what-is-an-ebike|cruiser-ebike|folding-ebike|city-ebike|fat-tire-ebike)')
       THEN 'pillar page'
 
-      -- 标准渠道分类
       WHEN default_channel_group = 'Affiliates'
         OR REGEXP_CONTAINS(session_medium, r'affiliate|avantlink|uppromote|goaffpro|impact')
         OR REGEXP_CONTAINS(session_source, r'affiliate|avantlink|uppromote|goaffpro|impact')
@@ -167,7 +151,6 @@ Session_Base_Mapped AS (
       WHEN default_channel_group = 'Paid Other'
         THEN 'paid other'
 
-      -- [注意] 这里将 ads, pr 定义为 paid referral
       WHEN REGEXP_CONTAINS(session_medium, r'ads|pr|paidreferral')
         THEN 'paid referral'
 
@@ -191,7 +174,6 @@ Session_Base_Mapped AS (
     Session_With_Flags
 ),
 
--- 4. 最终渠道逻辑 (Final Mapping)
 Session_Final_Mapped AS (
   SELECT
     date,
@@ -202,15 +184,12 @@ Session_Final_Mapped AS (
     purchase_revenue_in_usd,
     is_session_engaged,
     
-    -- 后缀拆分逻辑
     CASE 
-      WHEN base_channel IN ('pillar page', 'email', 'sms','unassigned') THEN base_channel
+      WHEN base_channel IN ('pillar page', 'email', 'sms', 'affiliates', 'unassigned') THEN base_channel
       
-      -- 只要满足以下任一条件，必须进入后缀拆分流程：
       WHEN is_initial_paid_flag 
            OR REGEXP_CONTAINS(base_channel, r'^paid') 
-           -- 【修复点】在这里加入了 'cross-network'
-           OR base_channel IN ('programmatic ads', 'connected tv', 'display', 'affiliates', 'kol', 'cross-network') 
+           OR base_channel IN ('programmatic ads', 'connected tv', 'display', 'kol', 'cross-network') 
       THEN
         CASE 
           WHEN CONTAINS_SUBSTR(session_campaign, '-aw') THEN base_channel || ':branding'
@@ -226,7 +205,6 @@ Session_Final_Mapped AS (
     Session_Base_Mapped
 ),
 
--- 5. 最终聚合 (Final Aggregation)
 Final_Aggregation AS (
   SELECT
     channel,
@@ -248,9 +226,6 @@ Final_Aggregation AS (
       0
     ) AS total_revenue,
     
-    -- [修正] 计算跳出数
-    -- 跳出 = 总 Sessions - Engaged Sessions
-    -- 如果 is_session_engaged = 1，则不是跳出；如果是 0，则是跳出
     COUNT(DISTINCT CASE WHEN is_session_engaged = 0 THEN session_id END) AS bounced_sessions
   FROM
     Session_Final_Mapped
@@ -258,7 +233,6 @@ Final_Aggregation AS (
     channel, date
 )
 
--- 6. 最终输出计算 (Output Calculation)
 SELECT
   channel,
   date,

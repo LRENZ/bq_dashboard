@@ -5,18 +5,13 @@ config {
   description: "User journey data with all channel touchpoints for attribution modeling"
 }
 
--- ============================================================================
--- 多渠道归因数据准备 SQL
--- ============================================================================
-
--- 1. 事件层数据提取
 WITH SessionEvents AS (
   WITH RawEvents AS (
     SELECT
       *,
       (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location') AS page_location
     FROM
-      ${ref('analytics_489554557', 'events_*')}
+      `bigquery-2024.analytics_489554557.events_*`
     WHERE
       event_name IN ('purchase', 'session_start', 'first_visit', 'page_view')
       AND _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY))
@@ -61,11 +56,9 @@ WITH SessionEvents AS (
     RawEvents AS raw
 ),
 
--- 2. 预计算标记层 (EventsWithFlags)
 EventsWithFlags AS (
   SELECT
     *,
-    -- 初始技术标记 (仅供参考，后续以 base_channel 为准)
     CASE 
       WHEN REGEXP_CONTAINS(default_channel_group, r'Paid') THEN TRUE
       WHEN default_channel_group = 'Display' THEN TRUE
@@ -76,7 +69,6 @@ EventsWithFlags AS (
   FROM SessionEvents
 ),
 
--- 3. 基础渠道映射 (BaseTouchpoints)
 BaseTouchpoints AS (
   SELECT
     unified_user_id,
@@ -90,14 +82,11 @@ BaseTouchpoints AS (
     transaction_value,
     is_initial_paid_flag,
     
-    -- 基础渠道分类逻辑
     CASE
-      -- Pillar Page: 必须是付费流量 + 特定页面
       WHEN is_initial_paid_flag 
            AND REGEXP_CONTAINS(page_location, r'/pages/(what-is-an-ebike|cruiser-ebike|folding-ebike|city-ebike|fat-tire-ebike)')
       THEN 'pillar page'
 
-      -- 标准渠道定义
       WHEN default_channel_group = 'Affiliates'
         OR REGEXP_CONTAINS(medium, r'affiliate|avantlink|uppromote|goaffpro|impact')
         OR REGEXP_CONTAINS(source, r'affiliate|avantlink|uppromote|goaffpro|impact')
@@ -172,7 +161,6 @@ BaseTouchpoints AS (
       WHEN default_channel_group = 'Paid Other'
         THEN 'paid other'
 
-      -- [注意] 这里定义了 paid referral
       WHEN REGEXP_CONTAINS(medium, r'ads|pr|paidreferral')
         THEN 'paid referral'
 
@@ -197,7 +185,6 @@ BaseTouchpoints AS (
     EventsWithFlags
 ),
 
--- 4. 最终渠道逻辑 (AllTouchpoints) - 核心修正
 AllTouchpoints AS (
   SELECT
     unified_user_id,
@@ -209,45 +196,35 @@ AllTouchpoints AS (
     transaction_id,
     transaction_value,
     
-    -- [修正 1] 强制修正 is_paid_traffic
-    -- 逻辑：如果 base_channel 名字以 "paid" 开头，或者属于特定的付费类型，强制标记为 TRUE
     CASE 
+      WHEN base_channel = 'affiliates' THEN FALSE
       WHEN REGEXP_CONTAINS(base_channel, r'^paid') THEN TRUE
-      WHEN base_channel IN ('programmatic ads', 'connected tv', 'display', 'affiliates', 'kol','cross-network') THEN TRUE
+      WHEN base_channel IN ('programmatic ads', 'connected tv', 'display', 'kol', 'cross-network') THEN TRUE
       WHEN is_initial_paid_flag THEN TRUE
       ELSE FALSE
     END AS is_paid_traffic,
     
-    -- [修正 2] 强制应用后缀逻辑
     CASE 
-      -- 排除不需要后缀的特定渠道
-      WHEN base_channel IN ('pillar page', 'email', 'sms','unassigned') THEN base_channel
+      WHEN base_channel IN ('pillar page', 'email', 'sms', 'affiliates', 'unassigned') THEN base_channel
       
-      -- 只要满足以下任一条件，必须进入后缀拆分流程：
-      -- 1. 初始标记是 Paid
-      -- 2. 计算出的渠道名以 'paid' 开头 (这就捕获了 paid referral, paid social 等)
-      -- 3. 属于特定付费列表 (在此处加入了 cross-network)
       WHEN is_initial_paid_flag 
            OR REGEXP_CONTAINS(base_channel, r'^paid') 
-           OR base_channel IN ('programmatic ads', 'connected tv', 'display', 'affiliates', 'kol', 'cross-network') 
+           OR base_channel IN ('programmatic ads', 'connected tv', 'display', 'kol', 'cross-network') 
       THEN
         CASE 
           WHEN CONTAINS_SUBSTR(campaign, '-aw') THEN base_channel || ':branding'
           WHEN CONTAINS_SUBSTR(campaign, '-cs') THEN base_channel || ':traffic'
           WHEN CONTAINS_SUBSTR(campaign, '-cv') THEN base_channel || ':conversion'
           WHEN CONTAINS_SUBSTR(campaign, '-rt') THEN base_channel || ':retargeting'
-          -- [关键] 默认为 conversion
           ELSE base_channel || ':conversion'
         END
       
-      -- 其他情况 (Organic, Direct 等)
       ELSE base_channel 
     END AS channel
 
   FROM BaseTouchpoints
 ),
 
--- 5. 识别购买事件
 PurchaseEvents AS (
   SELECT
     unified_user_id,
@@ -268,7 +245,6 @@ PurchaseEvents AS (
         DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 30 DAY)
 ),
 
--- 6. 构建用户购买旅程路径
 TransactionJourneys AS (
   SELECT
     p.unified_user_id,
@@ -300,7 +276,6 @@ TransactionJourneys AS (
     1, 2, 3, 4
 ),
 
--- 7. 展开路径为行级数据
 ExpandedPath AS (
   SELECT
     t.unified_user_id,
@@ -320,7 +295,6 @@ ExpandedPath AS (
     UNNEST(t.touchpoint_path) AS touchpoint
 ),
 
--- 8. 标记购买事件并去重连续相同渠道
 PathWithTransactions AS (
   SELECT
     unified_user_id,
@@ -347,7 +321,6 @@ PathWithTransactions AS (
     ExpandedPath
 ),
 
--- 9. 最终输出过滤
 FinalOutput AS (
   SELECT
     unified_user_id,
@@ -370,7 +343,6 @@ FinalOutput AS (
     OR event_name = 'purchase'
 )
 
--- 最终查询
 SELECT
   unified_user_id,
   event_date,
