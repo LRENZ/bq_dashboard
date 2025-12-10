@@ -2,28 +2,33 @@ config {
   type: "incremental",
   schema: "attribution",
   name: "channel_performance",
-  description: "Daily channel performance using DISTINCT transaction_id for conversions",
+  description: "Daily channel performance using DISTINCT transaction_id for conversions from two merged GA4 properties",
   uniqueKey: ["date", "channel"],
   bigquery: {
     partitionBy: "date",
     clusterBy: ["channel"],
     updatePartitionFilter: "date >= DATE_SUB(CURRENT_DATE('America/Los_Angeles'), INTERVAL 7 DAY)"
   },
-  tags: ["attribution", "ga4", "last-click"]
+  tags: ["attribution", "ga4", "last-click", "merged"]
 }
 
 WITH Session_Raw AS (
   SELECT
     user_pseudo_id,
-    (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS session_id,
+    -- [修正 1] 构造全局唯一的 Session ID (User ID + Property ID + Session Timestamp)，防止跨 Property 冲突
+    CONCAT(user_pseudo_id, '-', property_id, '-', (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id')) AS unique_session_id,
+    
+    (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS original_session_id,
     DATE(TIMESTAMP_MICROS(event_timestamp), "America/Los_Angeles") AS date,
+    
     MAX(
       CASE 
         WHEN (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'session_engaged') = '1' THEN 1 
         ELSE 0 
       END
-    ) OVER (PARTITION BY user_pseudo_id, (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id')) AS is_session_engaged,
+    ) OVER (PARTITION BY user_pseudo_id, property_id, (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id')) AS is_session_engaged,
     
+    -- 注意：last_click 字段在 GA4 中通常需要 24-72 小时才能稳定，因此必须回读多天数据
     session_traffic_source_last_click.cross_channel_campaign.default_channel_group AS default_channel_group,
 
     LOWER(COALESCE(
@@ -49,12 +54,24 @@ WITH Session_Raw AS (
     event_name,
     ecommerce.transaction_id,
     COALESCE(ecommerce.purchase_revenue_in_usd, 0) AS purchase_revenue_in_usd
-  FROM
-    `bigquery-2024.analytics_489554557.events_*`
+  FROM (
+    -- 第一个表 (旧数据)，查询到 2025-07-18 之前
+    SELECT *, '310494624' as property_id, _TABLE_SUFFIX AS table_suffix 
+    FROM `bigquery-2024.analytics_310494624.events_*`
+    WHERE _TABLE_SUFFIX < '20250718'
+
+    UNION ALL
+
+    -- 第二个表 (新数据)，从 2025-07-18 开始查询
+    SELECT *, '489554557' as property_id, _TABLE_SUFFIX AS table_suffix 
+    FROM `bigquery-2024.analytics_489554557.events_*`
+    WHERE _TABLE_SUFFIX >= '20250718'
+  )
+  -- 【错误修复】在这里引用新的列 table_suffix，而不是伪列 _TABLE_SUFFIX
   WHERE
     ${when(incremental(),
-      `_TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1 DAY))`,
-      `_TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 30 DAY))`
+      `table_suffix >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 7 DAY))`,
+      `table_suffix >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1080 DAY))`
     )}
 ),
 
@@ -180,7 +197,7 @@ Session_Final_Mapped AS (
   SELECT
     date,
     user_pseudo_id,
-    session_id,
+    unique_session_id, -- 传递修复后的 Session ID
     event_name,
     transaction_id,
     purchase_revenue_in_usd,
@@ -212,7 +229,8 @@ Final_Aggregation AS (
     channel,
     date,
     
-    COUNT(DISTINCT session_id) AS sessions,
+    -- 使用全局唯一的 unique_session_id 进行统计
+    COUNT(DISTINCT unique_session_id) AS sessions,
     COUNT(DISTINCT user_pseudo_id) AS users,
     
     COUNT(DISTINCT 
@@ -228,7 +246,8 @@ Final_Aggregation AS (
       0
     ) AS total_revenue,
     
-    COUNT(DISTINCT CASE WHEN is_session_engaged = 0 THEN session_id END) AS bounced_sessions
+    -- 使用全局唯一的 unique_session_id 计算跳出率
+    COUNT(DISTINCT CASE WHEN is_session_engaged = 0 THEN unique_session_id END) AS bounced_sessions
   FROM
     Session_Final_Mapped
   GROUP BY
