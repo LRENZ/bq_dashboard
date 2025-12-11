@@ -293,3 +293,5 @@ SELECT
   CURRENT_TIMESTAMP() AS updated_at
 FROM
   Final_MTA_Calculation
+
+

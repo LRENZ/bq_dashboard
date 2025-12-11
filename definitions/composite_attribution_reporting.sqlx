@@ -1,0 +1,68 @@
+config {
+  type: "incremental",
+  schema: "attribution",
+  name: "composite_attribution_reporting",
+  description: "Reporting table with YoY and MoM, runs incrementally",
+  uniqueKey: ["date", "channel"],
+  bigquery: {
+    partitionBy: "date",
+    clusterBy: ["channel"]
+  },
+  tags: ["attribution", "reporting"]
+}
+
+WITH 
+Current_Batch_Data AS (
+  SELECT *
+  FROM ${ref('composite_attribution_performance')}
+  WHERE
+    ${when(
+      incremental(),
+      `date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 7 DAY)`,
+      `date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1080 DAY)`
+    )}
+),
+
+Historical_Source AS (
+  SELECT 
+    date,
+    channel,
+    last_click_conversions,
+    last_click_revenue,
+    sessions,
+    users,
+    mta_conversions,
+    mta_revenue
+  FROM ${ref('composite_attribution_performance')}
+  WHERE date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 400 DAY)
+)
+
+SELECT
+  curr.*,
+
+   -- MoM (上月同日）
+  lm.last_click_conversions AS last_click_conversions_lm,
+  lm.last_click_revenue    AS last_click_revenue_lm,
+  lm.sessions              AS sessions_lm,
+  lm.users                 AS users_lm,
+  lm.mta_conversions       AS mta_conversions_lm,
+  lm.mta_revenue           AS mta_revenue_lm,
+
+  -- YoY（去年同日）
+  ly.last_click_conversions AS last_click_conversions_ly,
+  ly.last_click_revenue    AS last_click_revenue_ly,
+  ly.sessions              AS sessions_ly,
+  ly.users                 AS users_ly,
+  ly.mta_conversions       AS mta_conversions_ly,
+  ly.mta_revenue           AS mta_revenue_ly
+
+FROM
+  Current_Batch_Data curr
+
+LEFT JOIN Historical_Source lm
+  ON curr.channel = lm.channel
+  AND lm.date = DATE_SUB(curr.date, INTERVAL 1 MONTH)
+
+LEFT JOIN Historical_Source ly
+  ON curr.channel = ly.channel
+  AND ly.date = DATE_SUB(curr.date, INTERVAL 1 YEAR)
