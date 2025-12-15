@@ -9,6 +9,24 @@ WITH SessionEvents AS (
   WITH RawEvents AS (
     SELECT
       *,
+          -- session 内第一个 page_view 作为 landing page
+    FIRST_VALUE(
+      CASE
+        WHEN event_name = 'page_view'
+        THEN LOWER(
+          (SELECT value.string_value
+           FROM UNNEST(event_params)
+           WHERE key = 'page_location')
+        )
+      END
+    ) OVER (
+      PARTITION BY user_pseudo_id,
+                   (SELECT value.int_value
+                    FROM UNNEST(event_params)
+                    WHERE key = 'ga_session_id')
+      ORDER BY event_timestamp
+      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS landing_page,
       (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location') AS page_location
     FROM
       `bigquery-2024.analytics_489554557.events_*`
@@ -49,7 +67,7 @@ WITH SessionEvents AS (
       '(not set)'
     )) AS campaign,
     
-    LOWER(raw.page_location) AS page_location,
+    LOWER(raw.landing_page) AS landing_page,
     raw.ecommerce.transaction_id,
     COALESCE(raw.ecommerce.purchase_revenue_in_usd, 0) AS transaction_value
   FROM
@@ -77,14 +95,14 @@ BaseTouchpoints AS (
     source,
     medium,
     campaign,
-    page_location,
+    landing_page,
     transaction_id,
     transaction_value,
     is_initial_paid_flag,
     
     CASE
       WHEN is_initial_paid_flag 
-           AND REGEXP_CONTAINS(page_location, r'/pages/(what-is-an-ebike|cruiser-ebike|folding-ebike|city-ebike|fat-tire-ebike)')
+           AND REGEXP_CONTAINS(landing_page, r'/pages/(what-is-an-ebike|cruiser-ebike|folding-ebike|city-ebike|fat-tire-ebike)')
       THEN 'pillar page'
 
       WHEN default_channel_group = 'Affiliates'
@@ -345,6 +363,13 @@ FinalOutput AS (
 
 SELECT
   unified_user_id,
+   -- [新增] 根据格式倒推 ID 类型
+  CASE 
+    -- 如果是 数字.数字 格式，认为是 cookie_id
+    WHEN REGEXP_CONTAINS(CAST(unified_user_id AS STRING), r'^\d+\.\d+$') THEN 'cookie_id'
+    -- 否则认为是 user_id
+    ELSE 'user_id'
+  END AS user_id_type,
   event_date,
   channel,
   is_paid_traffic,
@@ -360,6 +385,7 @@ FROM
   FinalOutput
 GROUP BY
   unified_user_id,
+  user_id_type,
   event_date,
   channel,
   is_paid_traffic,

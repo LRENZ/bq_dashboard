@@ -40,6 +40,12 @@ Historical_Source AS (
 SELECT
   curr.*,
 
+    -- 新增字段：funnel_objective
+  CASE
+    WHEN STRPOS(curr.channel, ':') > 0 THEN SPLIT(curr.channel, ':')[OFFSET(1)]
+    ELSE 'none'
+  END AS funnel_objective,
+
    -- MoM (上月同日）
   lm.last_click_conversions AS last_click_conversions_lm,
   lm.last_click_revenue    AS last_click_revenue_lm,

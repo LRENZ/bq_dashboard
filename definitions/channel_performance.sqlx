@@ -50,22 +50,37 @@ WITH Session_Raw AS (
     )) AS session_campaign,
     
     LOWER((SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location')) AS page_location,
-    
+
+    FIRST_VALUE(
+  CASE
+    WHEN event_name = 'page_view'
+    THEN LOWER(
+      (SELECT value.string_value
+       FROM UNNEST(event_params)
+       WHERE key = 'page_location')
+    )
+  END
+) OVER (
+  PARTITION BY user_pseudo_id, property_id,
+               (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id')
+  ORDER BY event_timestamp
+  ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+) AS landing_page,
     event_name,
     ecommerce.transaction_id,
     COALESCE(ecommerce.purchase_revenue_in_usd, 0) AS purchase_revenue_in_usd
   FROM (
-    -- 第一个表 (旧数据)，查询到 2025-07-18 之前
+    -- 第一个表 (旧数据)，查询到 2025-07-28 之前
     SELECT *, '310494624' as property_id, _TABLE_SUFFIX AS table_suffix 
     FROM `bigquery-2024.analytics_310494624.events_*`
-    WHERE _TABLE_SUFFIX < '20250718'
+    WHERE _TABLE_SUFFIX < '20250728'
 
     UNION ALL
 
-    -- 第二个表 (新数据)，从 2025-07-18 开始查询
+    -- 第二个表 (新数据)，从 2025-07-28 开始查询
     SELECT *, '489554557' as property_id, _TABLE_SUFFIX AS table_suffix 
     FROM `bigquery-2024.analytics_489554557.events_*`
-    WHERE _TABLE_SUFFIX >= '20250718'
+    WHERE _TABLE_SUFFIX >= '20250728'
   )
   -- 【错误修复】在这里引用新的列 table_suffix，而不是伪列 _TABLE_SUFFIX
   WHERE
@@ -93,7 +108,7 @@ Session_Base_Mapped AS (
     *,
     CASE
       WHEN is_initial_paid_flag 
-           AND REGEXP_CONTAINS(page_location, r'/pages/(what-is-an-ebike|cruiser-ebike|folding-ebike|city-ebike|fat-tire-ebike)')
+           AND REGEXP_CONTAINS(landing_page, r'/pages/(what-is-an-ebike|cruiser-ebike|folding-ebike|city-ebike|fat-tire-ebike)')
       THEN 'pillar page'
 
       WHEN default_channel_group = 'Affiliates'

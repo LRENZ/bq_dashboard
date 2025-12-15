@@ -1,0 +1,131 @@
+config {
+  type: "incremental",
+  schema: "attribution",
+  name: "composite_campaign_attribution_performance",
+  description: "Campaign-level attribution metrics distributed from Channel totals based on Session share (calculated within campaign_performance), including all original weight metadata",
+  uniqueKey: ["date", "channel", "campaign"],
+  bigquery: {
+    partitionBy: "date",
+    clusterBy: ["channel", "campaign"],
+    updatePartitionFilter: "date >= DATE_SUB(CURRENT_DATE('America/Los_Angeles'), INTERVAL 7 DAY)"
+  },
+  tags: ["attribution", "campaign", "mta", "composite"],
+}
+
+WITH
+-- 1. 获取 Campaign 层级的基础表现，同时计算每个 Channel 的总 Session（窗口函数）
+Campaign_Base AS (
+  SELECT
+    date,
+    channel,
+    campaign,
+    session AS campaign_sessions,
+    users AS campaign_users,
+    conversion AS campaign_last_click_conversions,
+    revenue AS campaign_last_click_revenue,
+    SUM(session) OVER(PARTITION BY date, channel) AS channel_total_sessions 
+  FROM ${ref('channel_campaign_performance')}
+  WHERE ${when(
+    incremental(),
+      `date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 7 DAY)`,
+      `date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1080 DAY)`
+  )}
+),
+
+-- 2. 获取 Channel 层级的 MTA 总数以及所有元数据 (权重、来源等)
+Channel_MTA_Source AS (
+  SELECT
+    date,
+    channel,
+    mta_conversions AS channel_mta_conversions_total,
+    mta_revenue AS channel_mta_revenue_total,
+    attribution_weight,
+    original_markov_weight,
+    removal_effect,
+    fallback_weight,
+    channel_category,
+    weight_source,
+    bounce_rate AS channel_bounce_rate,
+    total_daily_conversions AS global_daily_conversions,
+    total_daily_revenue AS global_daily_revenue
+  FROM ${ref('composite_attribution_performance')}
+  WHERE ${when(
+    incremental(),
+     `date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 7 DAY)`,
+     `date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1080 DAY)`
+  )}
+),
+
+-- 3. 关联并执行分配逻辑
+Distribution_Calculation AS (
+  SELECT
+    base.date,
+    base.channel,
+    base.campaign,
+    base.campaign_sessions,
+    base.campaign_users,
+    base.campaign_last_click_conversions,
+    base.campaign_last_click_revenue,
+    src.attribution_weight,
+    src.original_markov_weight,
+    src.removal_effect,
+    src.fallback_weight,
+    src.channel_category,
+    src.weight_source,
+    -- 基于 channel_campaign_performance 表计算占比
+    CASE WHEN base.channel_total_sessions > 0
+         THEN SAFE_DIVIDE(base.campaign_sessions, base.channel_total_sessions)
+         ELSE 0
+    END AS session_share_ratio,
+    -- 拆分 MTA 转化和收入
+    CASE WHEN base.channel_total_sessions > 0
+         THEN src.channel_mta_conversions_total * SAFE_DIVIDE(base.campaign_sessions, base.channel_total_sessions)
+         ELSE 0
+    END AS campaign_mta_conversions,
+    CASE WHEN base.channel_total_sessions > 0
+         THEN src.channel_mta_revenue_total * SAFE_DIVIDE(base.campaign_sessions, base.channel_total_sessions)
+         ELSE 0
+    END AS campaign_mta_revenue
+  FROM Campaign_Base base
+  LEFT JOIN Channel_MTA_Source src
+    ON base.date = src.date
+    AND base.channel = src.channel
+)
+
+-- 4. 最终输出
+SELECT
+  date,
+  channel,
+  campaign,
+  -- Last Click 指标 (Campaign级)
+  campaign_last_click_conversions AS last_click_conversions,
+  campaign_last_click_revenue AS last_click_revenue,
+  campaign_sessions AS sessions,
+  campaign_users AS users,
+  -- 多触点归因指标 (Campaign级)
+  ROUND(campaign_mta_conversions, 2) AS mta_conversions,
+  ROUND(campaign_mta_revenue, 2) AS mta_revenue,
+  -- 权重信息 (继承自 Channel)
+  -- attribution_weight,
+  -- original_markov_weight,
+  -- removal_effect,
+  -- fallback_weight,
+  -- channel_category,
+  -- weight_source,
+  -- 对比指标 (MTA vs Last Click)
+  (campaign_mta_conversions - campaign_last_click_conversions) AS conversion_difference,
+  SAFE_DIVIDE((campaign_mta_conversions - campaign_last_click_conversions), NULLIF(campaign_last_click_conversions, 0)) AS conversion_uplift_rate,
+  (campaign_mta_revenue - campaign_last_click_revenue) AS revenue_difference,
+  SAFE_DIVIDE((campaign_mta_revenue - campaign_last_click_revenue), NULLIF(campaign_last_click_revenue, 0)) AS revenue_uplift_rate,
+  -- 效率指标 (Campaign级 Performance)
+  SAFE_DIVIDE(campaign_last_click_conversions, campaign_sessions) AS last_click_conversion_rate,
+  SAFE_DIVIDE(campaign_last_click_revenue, campaign_users) AS last_click_revenue_per_user,
+  SAFE_DIVIDE(campaign_last_click_revenue, NULLIF(campaign_last_click_conversions, 0)) AS last_click_aov,
+  -- 效率指标 (Campaign级 MTA)
+  SAFE_DIVIDE(campaign_mta_conversions, campaign_sessions) AS mta_conversion_rate,
+  SAFE_DIVIDE(campaign_mta_revenue, campaign_users) AS mta_revenue_per_user,
+  SAFE_DIVIDE(campaign_mta_revenue, NULLIF(campaign_mta_conversions, 0)) AS mta_aov,
+  -- 辅助元数据
+  session_share_ratio,
+  CURRENT_TIMESTAMP() AS updated_at
+FROM Distribution_Calculation
