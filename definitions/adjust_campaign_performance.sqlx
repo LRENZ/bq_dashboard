@@ -96,6 +96,10 @@ Distribution_Calculation AS (
 SELECT
   date,
   channel,
+  CASE
+    WHEN STRPOS(channel, ':') > 0 THEN SPLIT(channel, ':')[OFFSET(1)]
+    ELSE 'none'
+  END AS funnel_objective,
   campaign,
   -- Last Click 指标 (Campaign级)
   campaign_last_click_conversions AS last_click_conversions,
