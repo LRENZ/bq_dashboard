@@ -12,133 +12,183 @@ config {
   tags: ["attribution", "ga4", "last-click", "merged", "campaign"]
 }
 
-WITH Session_Raw AS (
+WITH Raw_Events AS (
+  -- 1. 基础数据抽取
+  SELECT 
+    event_timestamp,
+    event_name,
+    user_pseudo_id,
+    event_params,
+    traffic_source,
+    session_traffic_source_last_click,
+    ecommerce,
+    '310494624' as property_id,
+    _TABLE_SUFFIX AS table_suffix
+  FROM `bigquery-2024.analytics_310494624.events_*`
+  WHERE _TABLE_SUFFIX < '20250728'
+
+  UNION ALL
+
+  SELECT 
+    event_timestamp,
+    event_name,
+    user_pseudo_id,
+    event_params,
+    traffic_source,
+    session_traffic_source_last_click,
+    ecommerce,
+    '489554557' as property_id,
+    _TABLE_SUFFIX AS table_suffix
+  FROM `bigquery-2024.analytics_489554557.events_*`
+  WHERE _TABLE_SUFFIX >= '20250728'
+),
+
+Session_Windowed AS (
+  -- 2. 窗口补全层：将 Event Scope 转化为 Session Scope
+  -- 核心逻辑：使用 FIRST_VALUE 将会话开始时的来源和落地页，赋予会话内的所有事件(包括 Purchase)
   SELECT
     user_pseudo_id,
-    -- 构造全局唯一的 Session ID
+    property_id,
     CONCAT(user_pseudo_id, '-', property_id, '-', (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id')) AS unique_session_id,
-    
-    (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS original_session_id,
     DATE(TIMESTAMP_MICROS(event_timestamp), "America/Los_Angeles") AS date,
-    
-    MAX(
-      CASE 
-        WHEN (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'session_engaged') = '1' THEN 1 
-        ELSE 0 
-      END
-    ) OVER (PARTITION BY user_pseudo_id, property_id, (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id')) AS is_session_engaged,
-    
-    session_traffic_source_last_click.cross_channel_campaign.default_channel_group AS default_channel_group,
-
-    LOWER(COALESCE(
-      session_traffic_source_last_click.cross_channel_campaign.source,
-      (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'source'),
-      '(direct)'
-    )) AS session_source,
-    
-    LOWER(COALESCE(
-      session_traffic_source_last_click.cross_channel_campaign.medium,
-      (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'medium'),
-      '(none)'
-    )) AS session_medium,
-    
-    -- [关键数据源] 提取 campaign
-    LOWER(COALESCE(
-      session_traffic_source_last_click.cross_channel_campaign.campaign_name,
-      (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'campaign'),
-      '(not set)'
-    )) AS session_campaign,
-    
-    LOWER((SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location')) AS page_location,
-
-    FIRST_VALUE(
-  CASE
-    WHEN event_name = 'page_view'
-    THEN LOWER(
-      (SELECT value.string_value
-       FROM UNNEST(event_params)
-       WHERE key = 'page_location')
-    )
-  END
-) OVER (
-  PARTITION BY user_pseudo_id, property_id,
-               (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id')
-  ORDER BY event_timestamp
-  ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
-) AS landing_page,
-    
     event_name,
     ecommerce.transaction_id,
-    COALESCE(ecommerce.purchase_revenue_in_usd, 0) AS purchase_revenue_in_usd
-  FROM (
-    -- 第一个表 (旧数据)
-    SELECT *, '310494624' as property_id, _TABLE_SUFFIX AS table_suffix 
-    FROM `bigquery-2024.analytics_310494624.events_*`
-    WHERE _TABLE_SUFFIX < '20250728'
+    COALESCE(ecommerce.purchase_revenue_in_usd, 0) AS purchase_revenue_in_usd,
 
-    UNION ALL
+    -- 计算 Session Engaged
+    MAX(
+      CASE WHEN (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'session_engaged') = '1' THEN 1 ELSE 0 END
+    ) OVER (PARTITION BY user_pseudo_id, property_id, (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id')) AS is_session_engaged,
 
-    -- 第二个表 (新数据)
-    SELECT *, '489554557' as property_id, _TABLE_SUFFIX AS table_suffix 
-    FROM `bigquery-2024.analytics_489554557.events_*`
-    WHERE _TABLE_SUFFIX >= '20250728'
-  )
+    -- [关键] 构造 Session Scope 的 Source
+    FIRST_VALUE(
+      LOWER(COALESCE(
+        session_traffic_source_last_click.cross_channel_campaign.source,
+        (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'source')
+      )) IGNORE NULLS
+    ) OVER (
+      PARTITION BY user_pseudo_id, property_id, (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id')
+      ORDER BY event_timestamp
+      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS session_source,
+    
+    -- [关键] 构造 Session Scope 的 Medium
+    FIRST_VALUE(
+      LOWER(COALESCE(
+        session_traffic_source_last_click.cross_channel_campaign.medium,
+        (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'medium')
+      )) IGNORE NULLS
+    ) OVER (
+      PARTITION BY user_pseudo_id, property_id, (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id')
+      ORDER BY event_timestamp
+      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS session_medium,
+    
+    -- [关键] 构造 Session Scope 的 Campaign
+    FIRST_VALUE(
+      LOWER(COALESCE(
+        session_traffic_source_last_click.cross_channel_campaign.campaign_name,
+        (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'campaign')
+      )) IGNORE NULLS
+    ) OVER (
+      PARTITION BY user_pseudo_id, property_id, (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id')
+      ORDER BY event_timestamp
+      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS session_campaign,
+
+    -- [关键] 构造 Session Scope 的 Channel Group
+    FIRST_VALUE(
+      session_traffic_source_last_click.cross_channel_campaign.default_channel_group IGNORE NULLS
+    ) OVER (
+      PARTITION BY user_pseudo_id, property_id, (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id')
+      ORDER BY event_timestamp
+      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS raw_channel_group,
+
+    -- [关键] 构造 Session Scope 的 Landing Page (落地页)
+    FIRST_VALUE(
+      CASE WHEN event_name IN ('session_start', 'page_view') THEN
+        LOWER((SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location'))
+      END IGNORE NULLS
+    ) OVER (
+      PARTITION BY user_pseudo_id, property_id, (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id')
+      ORDER BY event_timestamp
+      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS landing_page
+
+  FROM Raw_Events
   WHERE
     ${when(incremental(),
       `table_suffix >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 7 DAY))`,
       `table_suffix >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1080 DAY))`
     )}
+    AND (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') IS NOT NULL
+),
+
+Session_Cleaned AS (
+  SELECT 
+    *,
+    COALESCE(session_source, '(direct)') as final_source,
+    COALESCE(session_medium, '(none)') as final_medium,
+    COALESCE(session_campaign, '(not set)') as final_campaign,
+    COALESCE(raw_channel_group, 'Unassigned') as default_channel_group
+  FROM Session_Windowed
 ),
 
 Session_With_Flags AS (
   SELECT
     *,
+    -- 这个 Flag 现在是完全基于 Session Scope 的 Medium 判断的
     CASE 
       WHEN REGEXP_CONTAINS(default_channel_group, r'Paid') THEN TRUE
       WHEN default_channel_group = 'Display' THEN TRUE
-      WHEN REGEXP_CONTAINS(session_medium, r'^(cpc|ppc|display|cpm|banner)$') THEN TRUE
-      WHEN session_medium LIKE '%paid%' THEN TRUE
+      WHEN REGEXP_CONTAINS(final_medium, r'^(cpc|ppc|display|cpm|banner)$') THEN TRUE
+      WHEN final_medium LIKE '%paid%' THEN TRUE
       ELSE FALSE
     END AS is_initial_paid_flag
-  FROM Session_Raw
+  FROM Session_Cleaned
 ),
 
 Session_Base_Mapped AS (
   SELECT
     *,
     CASE
+      -- Pillar Page 判定：
+      -- 1. 使用 is_initial_paid_flag (Session Scope 的付费标记)
+      -- 2. 使用 landing_page (Session Scope 的落地页)
+      -- 这样就实现了将 Pillar Page 作为 Session Scope 处理
       WHEN is_initial_paid_flag 
            AND REGEXP_CONTAINS(landing_page, r'/pages/(what-is-an-ebike|cruiser-ebike|folding-ebike|city-ebike|fat-tire-ebike)')
       THEN 'pillar page'
 
       WHEN default_channel_group = 'Affiliates'
-        OR REGEXP_CONTAINS(session_medium, r'affiliate|avantlink|uppromote|goaffpro|impact')
-        OR REGEXP_CONTAINS(session_source, r'affiliate|avantlink|uppromote|goaffpro|impact')
+        OR REGEXP_CONTAINS(final_medium, r'affiliate|avantlink|uppromote|goaffpro|impact')
+        OR REGEXP_CONTAINS(final_source, r'affiliate|avantlink|uppromote|goaffpro|impact')
         THEN 'affiliates'
 
       WHEN default_channel_group = 'SMS'
-        OR REGEXP_CONTAINS(session_medium, r'sms')
+        OR REGEXP_CONTAINS(final_medium, r'sms')
         THEN 'sms'
 
       WHEN default_channel_group = 'Email'
-        OR REGEXP_CONTAINS(session_source, r'klaviyo|email|substack|wunderkind')
-        OR session_medium = 'edm'
+        OR REGEXP_CONTAINS(final_source, r'klaviyo|email|substack|wunderkind')
+        OR final_medium = 'edm'
         THEN 'email'
 
-      WHEN REGEXP_CONTAINS(session_medium, r'kol')
-        OR session_source = 'kol'
+      WHEN REGEXP_CONTAINS(final_medium, r'kol')
+        OR final_source = 'kol'
         THEN 'kol'
 
-      WHEN session_medium = 'programmatic'
-        OR REGEXP_CONTAINS(session_source, r'ttd|outbrain|loopme|criteo|tradedesk')
+      WHEN final_medium = 'programmatic'
+        OR REGEXP_CONTAINS(final_source, r'ttd|outbrain|loopme|criteo|tradedesk')
         THEN 'programmatic ads'
 
-      WHEN (default_channel_group = 'Paid Search' OR session_medium IN ('cpc', 'ppc', 'paidsearch'))
-        AND REGEXP_CONTAINS(session_campaign, r'brand')
+      WHEN (default_channel_group = 'Paid Search' OR final_medium IN ('cpc', 'ppc', 'paidsearch'))
+        AND REGEXP_CONTAINS(final_campaign, r'brand')
         THEN 'paid brand search'
 
       WHEN (default_channel_group = 'Paid Search')
-        AND NOT REGEXP_CONTAINS(session_campaign, r'brand')
+        AND NOT REGEXP_CONTAINS(final_campaign, r'brand')
         THEN 'paid non-brand search'
 
       WHEN default_channel_group = 'Organic Search'
@@ -146,17 +196,17 @@ Session_Base_Mapped AS (
 
       WHEN (
           default_channel_group = 'Paid Social'
-          OR REGEXP_CONTAINS(session_source, r'facebook|twitter|youtube|instagram|reddit|fb|quora')
-          OR session_medium = 'paidsocial'
+          OR REGEXP_CONTAINS(final_source, r'facebook|twitter|youtube|instagram|reddit|fb|quora')
+          OR final_medium = 'paidsocial'
         )
-        AND session_medium != 'referral'
+        AND final_medium != 'referral'
         THEN 'paid social'
 
       WHEN default_channel_group = 'Organic Social'
         THEN 'organic social'
 
       WHEN default_channel_group = 'Paid Video'
-        OR session_medium = 'paidvideo'
+        OR final_medium = 'paidvideo'
         THEN 'paid video'
 
       WHEN default_channel_group = 'Organic Video'
@@ -169,7 +219,7 @@ Session_Base_Mapped AS (
         THEN 'organic shopping'
 
       WHEN default_channel_group = 'Display'
-        OR session_medium = 'paiddisplay'
+        OR final_medium = 'paiddisplay'
         THEN 'paid display'
 
       WHEN default_channel_group = 'Cross-network'
@@ -179,27 +229,27 @@ Session_Base_Mapped AS (
         THEN 'audio'
 
       WHEN default_channel_group = 'Mobile Push Notifications'
-        OR REGEXP_CONTAINS(session_medium, r'push')
+        OR REGEXP_CONTAINS(final_medium, r'push')
         THEN 'mobile push notifications'
 
       WHEN default_channel_group = 'Paid Other'
         THEN 'paid other'
 
-      WHEN REGEXP_CONTAINS(session_medium, r'ads|pr|paidreferral')
+      WHEN REGEXP_CONTAINS(final_medium, r'ads|pr|paidreferral')
         THEN 'paid referral'
 
       WHEN default_channel_group = 'Referral'
-        OR REGEXP_CONTAINS(session_source, r'chatgpt')
-        OR REGEXP_CONTAINS(session_medium, r'earnedreferral')
+        OR REGEXP_CONTAINS(final_source, r'chatgpt')
+        OR REGEXP_CONTAINS(final_medium, r'earnedreferral')
         THEN 'organic referral'
 
       WHEN default_channel_group = 'Direct'
-        OR session_source = '(direct)' 
-        OR session_medium IN ('(none)', 'none')
+        OR final_source = '(direct)' 
+        OR final_medium IN ('(none)', 'none')
         THEN 'direct'
 
-      WHEN REGEXP_CONTAINS(session_medium, r'tv|television|connectedtv')
-        OR REGEXP_CONTAINS(session_source, r'mntn')
+      WHEN REGEXP_CONTAINS(final_medium, r'tv|television|connectedtv')
+        OR REGEXP_CONTAINS(final_source, r'mntn')
         THEN 'connected tv'
 
       ELSE 'unassigned'
@@ -218,7 +268,7 @@ Session_Final_Mapped AS (
     purchase_revenue_in_usd,
     is_session_engaged,
     
-    session_campaign, 
+    final_campaign, 
 
     CASE 
       WHEN base_channel IN ('pillar page', 'email', 'sms', 'affiliates', 'unassigned','kol') THEN base_channel
@@ -228,10 +278,10 @@ Session_Final_Mapped AS (
            OR base_channel IN ('programmatic ads', 'connected tv', 'display', 'cross-network') 
       THEN
         CASE 
-          WHEN CONTAINS_SUBSTR(session_campaign, '-aw') THEN base_channel || ':branding'
-          WHEN CONTAINS_SUBSTR(session_campaign, '-cs') THEN base_channel || ':traffic'
-          WHEN CONTAINS_SUBSTR(session_campaign, '-cv') THEN base_channel || ':conversion'
-          WHEN CONTAINS_SUBSTR(session_campaign, '-rt') THEN base_channel || ':retargeting'
+          WHEN CONTAINS_SUBSTR(final_campaign, '-aw') THEN base_channel || ':branding'
+          WHEN CONTAINS_SUBSTR(final_campaign, '-cs') THEN base_channel || ':traffic'
+          WHEN CONTAINS_SUBSTR(final_campaign, '-cv') THEN base_channel || ':conversion'
+          WHEN CONTAINS_SUBSTR(final_campaign, '-rt') THEN base_channel || ':retargeting'
           ELSE base_channel || ':conversion'
         END
       
@@ -244,7 +294,7 @@ Session_Final_Mapped AS (
 Final_Aggregation AS (
   SELECT
     channel,
-    session_campaign AS campaign, 
+    final_campaign AS campaign, 
     date,
     
     COUNT(DISTINCT unique_session_id) AS sessions,
@@ -267,7 +317,7 @@ Final_Aggregation AS (
   FROM
     Session_Final_Mapped
   GROUP BY
-    channel, session_campaign, date
+    channel, final_campaign, date
 )
 
 SELECT
