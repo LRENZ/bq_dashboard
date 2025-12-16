@@ -2,79 +2,135 @@ config {
   type: "table",
   schema: "attribution",
   name: "session_source_medium",
-  description: "User journey data with all channel touchpoints for attribution modeling"
+  description: "User journey data with fixed session-scoped attribution touchpoints"
 }
 
-WITH SessionEvents AS (
-  WITH RawEvents AS (
-    SELECT
-      *,
-          -- session 内第一个 page_view 作为 landing page
+WITH RawEvents AS (
+  -- 1. 基础数据抽取
+  SELECT
+    user_pseudo_id,
+    user_id,
+    event_timestamp,
+    event_name,
+    event_params,
+    session_traffic_source_last_click,
+    ecommerce,
+    (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS ga_session_id
+  FROM
+    `bigquery-2024.analytics_489554557.events_*`
+  WHERE
+    event_name IN ('purchase', 'session_start', 'first_visit', 'page_view')
+    AND _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY))
+                           AND FORMAT_DATE('%Y%m%d', CURRENT_DATE())
+),
+
+Session_Windowed AS (
+  -- 2. Session Scope 数据补全 (核心修复)
+  -- 强制 Session 内所有事件继承 Session 开始时的来源和落地页
+  SELECT
+    user_pseudo_id,
+    user_id,
+    event_timestamp,
+    event_name,
+    ga_session_id,
+    ecommerce.transaction_id,
+    COALESCE(ecommerce.purchase_revenue_in_usd, 0) AS transaction_value,
+
+    -- [关键] 构造 Session Scope 的 Source
+    FIRST_VALUE(
+      LOWER(COALESCE(
+        session_traffic_source_last_click.cross_channel_campaign.source,
+        (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'source')
+      )) IGNORE NULLS
+    ) OVER (
+      PARTITION BY user_pseudo_id, ga_session_id 
+      ORDER BY event_timestamp
+      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS session_source,
+    
+    -- [关键] 构造 Session Scope 的 Medium
+    FIRST_VALUE(
+      LOWER(COALESCE(
+        session_traffic_source_last_click.cross_channel_campaign.medium,
+        (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'medium')
+      )) IGNORE NULLS
+    ) OVER (
+      PARTITION BY user_pseudo_id, ga_session_id 
+      ORDER BY event_timestamp
+      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS session_medium,
+    
+    -- [关键] 构造 Session Scope 的 Campaign
+    FIRST_VALUE(
+      LOWER(COALESCE(
+        session_traffic_source_last_click.cross_channel_campaign.campaign_name,
+        (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'campaign')
+      )) IGNORE NULLS
+    ) OVER (
+      PARTITION BY user_pseudo_id, ga_session_id 
+      ORDER BY event_timestamp
+      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS session_campaign,
+    
+    -- [关键] 构造 Session Scope 的 Channel Group
+    FIRST_VALUE(
+      session_traffic_source_last_click.cross_channel_campaign.default_channel_group IGNORE NULLS
+    ) OVER (
+      PARTITION BY user_pseudo_id, ga_session_id 
+      ORDER BY event_timestamp
+      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS raw_channel_group,
+
+    -- [关键] 构造 Session Scope 的 Landing Page
     FIRST_VALUE(
       CASE
-        WHEN event_name = 'page_view'
+        WHEN event_name = 'page_view' OR event_name = 'session_start'
         THEN LOWER(
           (SELECT value.string_value
            FROM UNNEST(event_params)
            WHERE key = 'page_location')
         )
-      END
+      END IGNORE NULLS
     ) OVER (
-      PARTITION BY user_pseudo_id,
-                   (SELECT value.int_value
-                    FROM UNNEST(event_params)
-                    WHERE key = 'ga_session_id')
+      PARTITION BY user_pseudo_id, ga_session_id
       ORDER BY event_timestamp
       ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
-    ) AS landing_page,
-      (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location') AS page_location
-    FROM
-      `bigquery-2024.analytics_489554557.events_*`
-    WHERE
-      event_name IN ('purchase', 'session_start', 'first_visit', 'page_view')
-      AND _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY))
-                             AND FORMAT_DATE('%Y%m%d', CURRENT_DATE())
-  )
+    ) AS landing_page
+
+  FROM RawEvents
+),
+
+SessionEvents AS (
+  -- 3. 数据清洗与 User ID 合并
   SELECT
+    -- 合并 User ID 逻辑 (保持你原有的逻辑)
     COALESCE(
-      LAST_VALUE(raw.user_id IGNORE NULLS) OVER (
-        PARTITION BY raw.user_pseudo_id 
-        ORDER BY raw.event_timestamp 
+      LAST_VALUE(user_id IGNORE NULLS) OVER (
+        PARTITION BY user_pseudo_id 
+        ORDER BY event_timestamp 
         ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
       ),
-      raw.user_pseudo_id
+      user_pseudo_id
     ) AS unified_user_id,
     
-    raw.event_timestamp,
-    raw.event_name,
-    raw.session_traffic_source_last_click.cross_channel_campaign.default_channel_group AS default_channel_group,
-
-    LOWER(COALESCE(
-      raw.session_traffic_source_last_click.cross_channel_campaign.source,
-      (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'source'),
-      '(direct)'
-    )) AS source,
+    event_timestamp,
+    event_name,
     
-    LOWER(COALESCE(
-      raw.session_traffic_source_last_click.cross_channel_campaign.medium,
-      (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'medium'),
-      '(none)'
-    )) AS medium,
+    -- 使用补全后的 Session Scope 数据
+    COALESCE(raw_channel_group, 'Unassigned') AS default_channel_group,
+    COALESCE(session_source, '(direct)') AS source,
+    COALESCE(session_medium, '(none)') AS medium,
+    COALESCE(session_campaign, '(not set)') AS campaign,
+    landing_page,
     
-    LOWER(COALESCE(
-      raw.session_traffic_source_last_click.cross_channel_campaign.campaign_name,
-      (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'campaign'),
-      '(not set)'
-    )) AS campaign,
-    
-    LOWER(raw.landing_page) AS landing_page,
-    raw.ecommerce.transaction_id,
-    COALESCE(raw.ecommerce.purchase_revenue_in_usd, 0) AS transaction_value
+    transaction_id,
+    transaction_value
   FROM
-    RawEvents AS raw
+    Session_Windowed
 ),
 
 EventsWithFlags AS (
+  -- 4. 标记付费流量 (基于 Session Scope 的 medium)
   SELECT
     *,
     CASE 
@@ -88,6 +144,7 @@ EventsWithFlags AS (
 ),
 
 BaseTouchpoints AS (
+  -- 5. 渠道归因逻辑
   SELECT
     unified_user_id,
     event_timestamp,
@@ -101,6 +158,7 @@ BaseTouchpoints AS (
     is_initial_paid_flag,
     
     CASE
+      -- Pillar Page: 使用 Session Scope 的 Landing Page 和 Paid Flag
       WHEN is_initial_paid_flag 
            AND REGEXP_CONTAINS(landing_page, r'/pages/(what-is-an-ebike|cruiser-ebike|folding-ebike|city-ebike|fat-tire-ebike)')
       THEN 'pillar page'
@@ -244,6 +302,7 @@ AllTouchpoints AS (
 ),
 
 PurchaseEvents AS (
+  -- 6. 提取交易事件 (保持不变)
   SELECT
     unified_user_id,
     transaction_id,
@@ -264,6 +323,7 @@ PurchaseEvents AS (
 ),
 
 TransactionJourneys AS (
+  -- 7. 构建用户路径 (保持不变)
   SELECT
     p.unified_user_id,
     p.transaction_id,
@@ -363,11 +423,8 @@ FinalOutput AS (
 
 SELECT
   unified_user_id,
-   -- [新增] 根据格式倒推 ID 类型
   CASE 
-    -- 如果是 数字.数字 格式，认为是 cookie_id
     WHEN REGEXP_CONTAINS(CAST(unified_user_id AS STRING), r'^\d+\.\d+$') THEN 'cookie_id'
-    -- 否则认为是 user_id
     ELSE 'user_id'
   END AS user_id_type,
   event_date,

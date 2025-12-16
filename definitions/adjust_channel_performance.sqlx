@@ -51,15 +51,15 @@ Daily_Totals AS (
     date
 ),
 
--- 3. 获取 MTA 权重
+-- 3. 获取 MTA 权重 (已移除 Fallback Weight)
 MTA_Weights AS (
   SELECT
     channel,
     Weight AS mta_weight,
     Original_Markov_Weight AS original_markov_weight,
     Removal_Effect AS removal_effect,
-    -- Fallback_Weight AS fallback_weight,
-    -- Channel_Category AS channel_category,
+    -- [Fix] Removed fallback_weight reference
+    -- [Fix] Removed channel_category reference if not needed or source issue
     Weight_Source AS weight_source
   FROM
     ${ref('mta_weights_complete')}
@@ -78,8 +78,7 @@ Channel_With_Weights AS (
     COALESCE(mw.mta_weight, 0) AS raw_weight,
     COALESCE(mw.original_markov_weight, 0) AS original_markov_weight,
     COALESCE(mw.removal_effect, 0) AS removal_effect,
-    -- COALESCE(mw.fallback_weight, 0) AS fallback_weight,
-    -- COALESCE(mw.channel_category, 'missing_weight') AS channel_category,
+    -- [Fix] Removed fallback_weight reference
     COALESCE(mw.weight_source, 'Missing Weight') AS weight_source
   FROM
     Raw_Performance rp
@@ -112,8 +111,7 @@ Normalized_Weights AS (
     cw.raw_weight,
     cw.original_markov_weight,
     cw.removal_effect,
-    -- cw.fallback_weight,
-    -- cw.channel_category,
+    -- [Fix] Removed fallback_weight reference
     cw.weight_source,
     dws.daily_weight_sum,
     
@@ -143,8 +141,7 @@ Initial_MTA_Calculation AS (
     nw.normalized_weight,
     nw.original_markov_weight,
     nw.removal_effect,
-    -- nw.fallback_weight,
-    -- nw.channel_category,
+    -- [Fix] Removed fallback_weight reference
     nw.weight_source,
     nw.daily_weight_sum,
     dt.total_daily_conversions,
@@ -184,8 +181,7 @@ Final_MTA_Calculation AS (
     imc.normalized_weight,
     imc.original_markov_weight,
     imc.removal_effect,
-    -- imc.fallback_weight,
-    -- imc.channel_category,
+    -- [Fix] Removed fallback_weight reference
     imc.weight_source,
     imc.daily_weight_sum,
     imc.total_daily_conversions,
@@ -256,8 +252,7 @@ SELECT
   normalized_weight AS attribution_weight,
   original_markov_weight,
   removal_effect,
-  -- fallback_weight,
-  -- channel_category,
+  -- [Fix] Removed fallback_weight from output
   weight_source,
   
   -- ========== 对比指标 ==========
@@ -293,5 +288,3 @@ SELECT
   CURRENT_TIMESTAMP() AS updated_at
 FROM
   Final_MTA_Calculation
-
-
