@@ -68,8 +68,11 @@ Performance_Stats AS (
 Combined_Data AS (
   SELECT
     auc.channel,
+    -- 如果 markov 表里没有这个 channel，这里就是 0
     COALESCE(mw.markov_weight, 0) AS markov_weight,
     COALESCE(mw.removal_effect, 0) AS removal_effect,
+    
+    -- 仅作为参考数据展示，不参与权重计算
     COALESCE(js.journey_conversions, 0) AS journey_conversions,
     COALESCE(js.journey_revenue, 0) AS journey_revenue,
     COALESCE(js.journey_users, 0) AS journey_users,
@@ -77,24 +80,6 @@ Combined_Data AS (
     COALESCE(ps.performance_revenue, 0) AS performance_revenue,
     COALESCE(ps.performance_sessions, 0) AS performance_sessions,
     COALESCE(ps.performance_users, 0) AS performance_users,
-    os.total_journey_conversions,
-    os.total_journey_revenue,
-    os.total_performance_conversions,
-    os.total_performance_revenue,
-    
-    CASE
-      -- 1. 明确被模型判定无效的
-      WHEN mw.channel IS NOT NULL AND COALESCE(mw.removal_effect, 0) = 0 THEN 'zero_removal_effect'
-      
-      -- 2. 正常的 Markov 权重
-      WHEN mw.channel IS NOT NULL AND mw.markov_weight > 0 THEN 'has_markov_weight'
-      
-      -- 3. Fallback 逻辑
-      WHEN js.channel IS NOT NULL AND ps.channel IS NOT NULL THEN 'has_fallback_weight'
-      WHEN js.channel IS NOT NULL AND ps.channel IS NULL THEN 'in_journey_only'
-      WHEN ps.channel IS NOT NULL AND js.channel IS NULL THEN 'in_performance_only'
-      ELSE 'unknown'
-    END AS channel_category,
     
     mw.run_date,
     mw.run_timestamp
@@ -103,8 +88,8 @@ Combined_Data AS (
   LEFT JOIN Latest_Markov_Weights mw ON auc.channel = mw.channel
   LEFT JOIN Journey_Stats js ON auc.channel = js.channel
   LEFT JOIN Performance_Stats ps ON auc.channel = ps.channel
-  CROSS JOIN Overall_Stats os
 ),
+
 
 -- Calculated_Weights AS (
 --   SELECT
@@ -143,22 +128,7 @@ Final_Weights AS (
     channel,
     markov_weight AS original_markov_weight,
     removal_effect,
-    channel_category,
-    fallback_weight,
     
-    -- -- [关键修改] 不再强行给 0.0001
-    -- CASE
-    --   -- 1. 被模型判定无效 -> 0
-    --   WHEN channel_category = 'zero_removal_effect' THEN 0
-      
-    --   -- 2. 有 Markov 权重 -> 使用 Markov
-    --   WHEN channel_category = 'has_markov_weight' THEN markov_weight
-      
-    --   -- 3. 其他情况 -> 使用计算出的 fallback_weight
-    --   -- 如果 fallback_weight 是 0 (因为没转化)，那么 raw_weight 就是 0
-    --   ELSE COALESCE(fallback_weight, 0)
-    -- END AS raw_weight,
-
     -- [关键修改] 直接使用 markov_weight，如果是 0 或 NULL，结果就是 0
     COALESCE(markov_weight, 0) AS raw_weight,
     
@@ -169,38 +139,31 @@ Final_Weights AS (
     performance_revenue,
     performance_sessions,
     performance_users,
-    journey_conv_share,
-    journey_rev_share,
-    perf_conv_share,
-    perf_rev_share,
     run_date,
     run_timestamp
   FROM
-    Calculated_Weights
+    Combined_Data
 ),
+
 
 Normalized_Weights AS (
   SELECT
     channel,
     original_markov_weight,
     removal_effect,
-    channel_category,
-    fallback_weight,
     raw_weight,
     
-    -- 归一化：只要所有的 raw_weight 加起来大于0，就可以正常归一化
+    -- 归一化：为了保险起见，将所有 markov 权重重新缩放为 1
+    -- 如果原模型输出本身就是 1，这里的计算结果不会变
     CASE 
       WHEN SUM(raw_weight) OVER () > 0 THEN SAFE_DIVIDE(raw_weight, SUM(raw_weight) OVER ())
-      ELSE 0 -- 防止极端的除以0情况（理论上不可能，除非全网无转化）
+      ELSE 0 
     END AS normalized_weight,
     
+    -- 简化 Source 标记
     CASE
-      WHEN channel_category = 'has_markov_weight' THEN 'Markov Chain'
-      WHEN channel_category = 'zero_removal_effect' THEN 'Forced Zero (Zero Removal Effect)'
-      WHEN channel_category = 'has_fallback_weight' THEN 'Fallback (Linear/Data Combined)'
-      WHEN channel_category = 'in_journey_only' THEN 'Fallback (Journey Only)'
-      WHEN channel_category = 'in_performance_only' THEN 'Fallback (Performance Only)'
-      ELSE 'Fallback (Unknown)'
+      WHEN raw_weight > 0 THEN 'Markov Chain'
+      ELSE 'No Markov Weight (Zero)'
     END AS weight_source,
     
     journey_conversions,
@@ -210,10 +173,6 @@ Normalized_Weights AS (
     performance_revenue,
     performance_sessions,
     performance_users,
-    journey_conv_share,
-    journey_rev_share,
-    perf_conv_share,
-    perf_rev_share,
     run_date,
     run_timestamp
   FROM
@@ -225,8 +184,6 @@ SELECT
   normalized_weight AS Weight,
   original_markov_weight AS Original_Markov_Weight,
   removal_effect AS Removal_Effect,
-  fallback_weight AS Fallback_Weight,
-  channel_category AS Channel_Category,
   weight_source AS Weight_Source,
   journey_conversions AS Journey_Conversions,
   journey_revenue AS Journey_Revenue,
@@ -235,16 +192,10 @@ SELECT
   journey_users AS Journey_Users,
   performance_users AS Performance_Users,
   performance_sessions AS Performance_Sessions,
-  ROUND(COALESCE(journey_conv_share, 0) * 100, 2) AS Journey_Conv_Share_Pct,
-  ROUND(COALESCE(journey_rev_share, 0) * 100, 2) AS Journey_Rev_Share_Pct,
-  ROUND(COALESCE(perf_conv_share, 0) * 100, 2) AS Perf_Conv_Share_Pct,
-  ROUND(COALESCE(perf_rev_share, 0) * 100, 2) AS Perf_Rev_Share_Pct,
   run_date AS Markov_Run_Date,
   run_timestamp AS Markov_Run_Timestamp,
   CURRENT_TIMESTAMP() AS Created_Timestamp
 FROM
   Normalized_Weights
-WHERE
-  normalized_weight >= 0 -- 保留 0 值行，以便查看哪些渠道没有权重
 ORDER BY
   normalized_weight DESC
