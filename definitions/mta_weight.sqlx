@@ -53,17 +53,17 @@ Performance_Stats AS (
     channel
 ),
 
-Overall_Stats AS (
-  SELECT
-    COALESCE(SUM(js.journey_conversions), 0) AS total_journey_conversions,
-    COALESCE(SUM(js.journey_revenue), 0) AS total_journey_revenue,
-    COALESCE(SUM(ps.performance_conversions), 0) AS total_performance_conversions,
-    COALESCE(SUM(ps.performance_revenue), 0) AS total_performance_revenue
-  FROM
-    All_Unique_Channels auc
-  LEFT JOIN Journey_Stats js ON auc.channel = js.channel
-  LEFT JOIN Performance_Stats ps ON auc.channel = ps.channel
-),
+-- Overall_Stats AS (
+--   SELECT
+--     COALESCE(SUM(js.journey_conversions), 0) AS total_journey_conversions,
+--     COALESCE(SUM(js.journey_revenue), 0) AS total_journey_revenue,
+--     COALESCE(SUM(ps.performance_conversions), 0) AS total_performance_conversions,
+--     COALESCE(SUM(ps.performance_revenue), 0) AS total_performance_revenue
+--   FROM
+--     All_Unique_Channels auc
+--   LEFT JOIN Journey_Stats js ON auc.channel = js.channel
+--   LEFT JOIN Performance_Stats ps ON auc.channel = ps.channel
+-- ),
 
 Combined_Data AS (
   SELECT
@@ -106,37 +106,37 @@ Combined_Data AS (
   CROSS JOIN Overall_Stats os
 ),
 
-Calculated_Weights AS (
-  SELECT
-    channel,
-    markov_weight,
-    removal_effect,
-    channel_category,
-    journey_conversions,
-    journey_revenue,
-    journey_users,
-    performance_conversions,
-    performance_revenue,
-    performance_sessions,
-    performance_users,
+-- Calculated_Weights AS (
+--   SELECT
+--     channel,
+--     markov_weight,
+--     removal_effect,
+--     channel_category,
+--     journey_conversions,
+--     journey_revenue,
+--     journey_users,
+--     performance_conversions,
+--     performance_revenue,
+--     performance_sessions,
+--     performance_users,
     
-    SAFE_DIVIDE(journey_conversions, NULLIF(total_journey_conversions, 0)) AS journey_conv_share,
-    SAFE_DIVIDE(journey_revenue, NULLIF(total_journey_revenue, 0)) AS journey_rev_share,
-    SAFE_DIVIDE(performance_conversions, NULLIF(total_performance_conversions, 0)) AS perf_conv_share,
-    SAFE_DIVIDE(performance_revenue, NULLIF(total_performance_revenue, 0)) AS perf_rev_share,
+--     SAFE_DIVIDE(journey_conversions, NULLIF(total_journey_conversions, 0)) AS journey_conv_share,
+--     SAFE_DIVIDE(journey_revenue, NULLIF(total_journey_revenue, 0)) AS journey_rev_share,
+--     SAFE_DIVIDE(performance_conversions, NULLIF(total_performance_conversions, 0)) AS perf_conv_share,
+--     SAFE_DIVIDE(performance_revenue, NULLIF(total_performance_revenue, 0)) AS perf_rev_share,
     
-    -- 计算兜底权重 (如果各项指标都是0，这里算出来就是0)
-    COALESCE(SAFE_DIVIDE(journey_conversions, NULLIF(total_journey_conversions, 0)), 0) * 0.25 +
-    COALESCE(SAFE_DIVIDE(journey_revenue, NULLIF(total_journey_revenue, 0)), 0) * 0.20 +
-    COALESCE(SAFE_DIVIDE(performance_conversions, NULLIF(total_performance_conversions, 0)), 0) * 0.30 +
-    COALESCE(SAFE_DIVIDE(performance_revenue, NULLIF(total_performance_revenue, 0)), 0) * 0.25
-    AS fallback_weight,
+--     -- 计算兜底权重 (如果各项指标都是0，这里算出来就是0)
+--     COALESCE(SAFE_DIVIDE(journey_conversions, NULLIF(total_journey_conversions, 0)), 0) * 0.25 +
+--     COALESCE(SAFE_DIVIDE(journey_revenue, NULLIF(total_journey_revenue, 0)), 0) * 0.20 +
+--     COALESCE(SAFE_DIVIDE(performance_conversions, NULLIF(total_performance_conversions, 0)), 0) * 0.30 +
+--     COALESCE(SAFE_DIVIDE(performance_revenue, NULLIF(total_performance_revenue, 0)), 0) * 0.25
+--     AS fallback_weight,
     
-    run_date,
-    run_timestamp
-  FROM
-    Combined_Data
-),
+--     run_date,
+--     run_timestamp
+--   FROM
+--     Combined_Data
+-- ),
 
 Final_Weights AS (
   SELECT
@@ -146,18 +146,21 @@ Final_Weights AS (
     channel_category,
     fallback_weight,
     
-    -- [关键修改] 不再强行给 0.0001
-    CASE
-      -- 1. 被模型判定无效 -> 0
-      WHEN channel_category = 'zero_removal_effect' THEN 0
+    -- -- [关键修改] 不再强行给 0.0001
+    -- CASE
+    --   -- 1. 被模型判定无效 -> 0
+    --   WHEN channel_category = 'zero_removal_effect' THEN 0
       
-      -- 2. 有 Markov 权重 -> 使用 Markov
-      WHEN channel_category = 'has_markov_weight' THEN markov_weight
+    --   -- 2. 有 Markov 权重 -> 使用 Markov
+    --   WHEN channel_category = 'has_markov_weight' THEN markov_weight
       
-      -- 3. 其他情况 -> 使用计算出的 fallback_weight
-      -- 如果 fallback_weight 是 0 (因为没转化)，那么 raw_weight 就是 0
-      ELSE COALESCE(fallback_weight, 0)
-    END AS raw_weight,
+    --   -- 3. 其他情况 -> 使用计算出的 fallback_weight
+    --   -- 如果 fallback_weight 是 0 (因为没转化)，那么 raw_weight 就是 0
+    --   ELSE COALESCE(fallback_weight, 0)
+    -- END AS raw_weight,
+
+    -- [关键修改] 直接使用 markov_weight，如果是 0 或 NULL，结果就是 0
+    COALESCE(markov_weight, 0) AS raw_weight,
     
     journey_conversions,
     journey_revenue,

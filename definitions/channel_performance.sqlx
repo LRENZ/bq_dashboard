@@ -15,7 +15,7 @@ config {
 WITH Session_Raw AS (
   SELECT
     user_pseudo_id,
-    -- [修正 1] 构造全局唯一的 Session ID (User ID + Property ID + Session Timestamp)，防止跨 Property 冲突
+    -- 构造全局唯一的 Session ID (User ID + Property ID + Session Timestamp)，防止跨 Property 冲突
     CONCAT(user_pseudo_id, '-', property_id, '-', (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id')) AS unique_session_id,
     
     (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS original_session_id,
@@ -212,7 +212,7 @@ Session_Final_Mapped AS (
   SELECT
     date,
     user_pseudo_id,
-    unique_session_id, -- 传递修复后的 Session ID
+    unique_session_id, -- 传递 Session ID
     event_name,
     transaction_id,
     purchase_revenue_in_usd,
