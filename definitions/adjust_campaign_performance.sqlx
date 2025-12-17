@@ -6,8 +6,7 @@ config {
   uniqueKey: ["date", "channel", "campaign"],
   bigquery: {
     partitionBy: "date",
-    clusterBy: ["channel", "campaign"],
-    updatePartitionFilter: "date >= DATE_SUB(CURRENT_DATE('America/Los_Angeles'), INTERVAL 7 DAY)"
+    clusterBy: ["channel", "campaign"]
   },
   tags: ["attribution", "campaign", "mta", "composite"],
 }
