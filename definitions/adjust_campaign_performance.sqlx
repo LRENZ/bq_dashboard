@@ -96,6 +96,7 @@ SELECT
   date,
   channel,
   CASE
+    WHEN channel = 'pillar page' THEN 'pillar page'
     WHEN STRPOS(channel, ':') > 0 THEN SPLIT(channel, ':')[OFFSET(1)]
     ELSE 'none'
   END AS funnel_objective,

@@ -42,6 +42,7 @@ SELECT
 
     -- 新增字段：funnel_objective
   CASE
+    WHEN curr.channel = 'pillar page' THEN 'pillar page'
     WHEN STRPOS(curr.channel, ':') > 0 THEN SPLIT(curr.channel, ':')[OFFSET(1)]
     ELSE 'none'
   END AS funnel_objective,
