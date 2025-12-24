@@ -151,6 +151,13 @@ Normalized_Weights AS (
     channel,
     original_markov_weight,
     removal_effect,
+    -- 在 SQL 里对 removal_effect 进行归一化
+    CASE 
+      WHEN SUM(removal_effect) OVER () > 0 
+      THEN SAFE_DIVIDE(removal_effect, SUM(removal_effect) OVER ())
+      ELSE 0 
+    END AS normalized_removal_effect,
+
     raw_weight,
     
     -- 归一化：为了保险起见，将所有 markov 权重重新缩放为 1
@@ -183,7 +190,7 @@ SELECT
   channel,
   normalized_weight AS Weight,
   original_markov_weight AS Original_Markov_Weight,
-  removal_effect AS Removal_Effect,
+  normalized_removal_effect AS Removal_Effect,
   weight_source AS Weight_Source,
   journey_conversions AS Journey_Conversions,
   journey_revenue AS Journey_Revenue,
