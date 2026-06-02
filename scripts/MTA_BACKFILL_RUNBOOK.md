@@ -27,7 +27,7 @@ From a machine with Node.js and BigQuery credentials:
 
 ```bash
 pip install -r cloud-function/markov-python/requirements.txt
-python scripts/markov_backfill_python.py --start=2026-01-01 --end=2026-06-01 --keyfile="C:/Users/HP/Downloads/bigquery-2024-d889a9800188.json"
+python scripts/markov_monthly_backfill.py --monthly-start=2025-09-01 --monthly-end=2026-05-31 --keyfile="C:/Users/HP/Downloads/bigquery-2024-d889a9800188.json"
 ```
 
 Adjust `--end` to the last date you want to backfill.
@@ -49,15 +49,15 @@ The first two validation queries should return zero rows. The third query is dia
 
 ## Cloud Function Backfill Option
 
-If you do not want to run the local script, deploy `cloud-function/markov-backfill-python` with entry point `backfill_markov`.
+If you do not want to run the local script, deploy `cloud-function/markov-backfill-python` with entry point `backfill_monthly_markov`.
 
 Run it in batches:
 
 ```text
-?startDate=2026-01-01&endDate=2026-06-01&maxDays=7
+?monthlyStart=2025-09-01&monthlyEnd=2026-05-31&maxMonths=3
 ```
 
-Use the returned `nextStartDate` for the next request. On the final request, you can add:
+Use the returned `nextMonthlyStart` for the next request. On the final request, you can add:
 
 ```text
 &triggerDataformAfter=true

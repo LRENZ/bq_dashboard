@@ -33,6 +33,7 @@ class Config:
     # Pass triggerDataformAfter=true in the final request to trigger once.
     TRIGGER_DATAFORM_AFTER = os.environ.get("TRIGGER_DATAFORM_AFTER", "false").lower() == "true"
     BACKFILL_MAX_DAYS = int(os.environ.get("BACKFILL_MAX_DAYS", "7"))
+    BACKFILL_MAX_MONTHS = int(os.environ.get("BACKFILL_MAX_MONTHS", "3"))
     DATAFORM_REGION = os.environ.get("DATAFORM_REGION", "us-central1")
     DATAFORM_REPOSITORY_ID = os.environ.get("DATAFORM_REPOSITORY_ID", "bq")
     DATAFORM_WORKFLOW_CONFIG_ID = os.environ.get("DATAFORM_WORKFLOW_CONFIG_ID", "ga4_attribution")
@@ -740,5 +741,211 @@ def backfill_markov(request):
         ), 200
     except Exception as exc:
         logger.error("Backfill failed: %s", exc)
+        traceback.print_exc()
+        return json.dumps({"status": "error", "message": str(exc)}), 500
+
+
+def first_day_of_month(value):
+    return date(value.year, value.month, 1)
+
+
+def last_day_of_month(value):
+    if value.month == 12:
+        return date(value.year + 1, 1, 1) - timedelta(days=1)
+    return date(value.year, value.month + 1, 1) - timedelta(days=1)
+
+
+def add_month(value):
+    if value.month == 12:
+        return date(value.year + 1, 1, 1)
+    return date(value.year, value.month + 1, 1)
+
+
+def iter_months(start_month, end_month, max_months):
+    current = first_day_of_month(start_month)
+    end = first_day_of_month(end_month)
+    processed = 0
+    while current <= end and (max_months <= 0 or processed < max_months):
+        yield current
+        current = add_month(current)
+        processed += 1
+
+
+def iter_date_range(start_date, end_date):
+    current = start_date
+    while current <= end_date:
+        yield current
+        current += timedelta(days=1)
+
+
+def chunk_values(values, size):
+    for index in range(0, len(values), size):
+        yield values[index:index + size]
+
+
+def fetch_report_min_date(client):
+    query = f"SELECT MIN(date) AS min_date FROM `{Config.PROJECT_ID}.attribution.channel_performance`"
+    rows = list(client.query(query, location=Config.BQ_LOCATION).result())
+    return rows[0]["min_date"]
+
+
+def load_source_data_for_window(client, window_start_date, window_end_date):
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("window_start_date", "DATE", window_start_date.isoformat()),
+            bigquery.ScalarQueryParameter("target_date", "DATE", window_end_date.isoformat()),
+        ]
+    )
+    query = ATTRIBUTION_QUERY.format(source_events_table=Config.SOURCE_EVENTS_TABLE)
+    df_raw = client.query(query, job_config=job_config, location=Config.BQ_LOCATION).result().to_dataframe()
+    df = prepare_data(df_raw)
+    return create_transaction_paths(df), len(df_raw)
+
+
+def merge_weights_for_dates(client, df_weights, weight_dates, window_start_date, window_end_date):
+    if df_weights.empty or not weight_dates:
+        return
+
+    run_timestamp = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for weight_date in weight_dates:
+        for _, row in df_weights.iterrows():
+            rows.append(
+                "SELECT DATE '{weight_date}' AS weight_date, DATE '{window_start}' AS window_start_date, "
+                "DATE '{window_end}' AS window_end_date, '{channel}' AS channel, "
+                "{removal_effect} AS removal_effect, {weight} AS weight, TIMESTAMP('{run_timestamp}') AS run_timestamp".format(
+                    weight_date=weight_date.isoformat(),
+                    window_start=window_start_date.isoformat(),
+                    window_end=window_end_date.isoformat(),
+                    channel=str(row["channel"]).replace("'", "''"),
+                    removal_effect=float(row["Removal_Effect"]),
+                    weight=float(row["Weight"]),
+                    run_timestamp=run_timestamp,
+                )
+            )
+
+    for rows_chunk in chunk_values(rows, 3000):
+        query = f"""
+        MERGE `{Config.DAILY_WEIGHT_TABLE}` AS target
+        USING ({' UNION ALL '.join(rows_chunk)}) AS source
+        ON target.weight_date = source.weight_date
+          AND target.channel = source.channel
+        WHEN MATCHED THEN UPDATE SET
+          window_start_date = source.window_start_date,
+          window_end_date = source.window_end_date,
+          removal_effect = source.removal_effect,
+          weight = source.weight,
+          run_timestamp = source.run_timestamp
+        WHEN NOT MATCHED THEN INSERT (
+          weight_date, window_start_date, window_end_date, channel, removal_effect, weight, run_timestamp
+        ) VALUES (
+          source.weight_date, source.window_start_date, source.window_end_date, source.channel,
+          source.removal_effect, source.weight, source.run_timestamp
+        )
+        """
+        client.query(query, location=Config.BQ_LOCATION).result()
+
+
+def parse_monthly_backfill_request(request):
+    if hasattr(request, "get_json"):
+        payload = request.get_json(silent=True) or {}
+        args = request.args or {}
+        monthly_start = args.get("monthlyStart") or payload.get("monthlyStart") or "2025-09-01"
+        monthly_end = args.get("monthlyEnd") or payload.get("monthlyEnd") or "2026-05-31"
+        fallback_start = args.get("fallbackStart") or payload.get("fallbackStart")
+        max_months = args.get("maxMonths") or payload.get("maxMonths")
+        trigger_after = args.get("triggerDataformAfter") or payload.get("triggerDataformAfter")
+    elif isinstance(request, dict):
+        monthly_start = request.get("monthlyStart") or "2025-09-01"
+        monthly_end = request.get("monthlyEnd") or "2026-05-31"
+        fallback_start = request.get("fallbackStart")
+        max_months = request.get("maxMonths")
+        trigger_after = request.get("triggerDataformAfter")
+    else:
+        monthly_start, monthly_end, fallback_start, max_months, trigger_after = "2025-09-01", "2026-05-31", None, None, None
+
+    return (
+        datetime.strptime(monthly_start, "%Y-%m-%d").date(),
+        datetime.strptime(monthly_end, "%Y-%m-%d").date(),
+        datetime.strptime(fallback_start, "%Y-%m-%d").date() if fallback_start else None,
+        Config.BACKFILL_MAX_MONTHS if max_months is None else int(max_months),
+        str(trigger_after).lower() == "true",
+    )
+
+
+def backfill_monthly_markov(request):
+    try:
+        monthly_start, monthly_end, fallback_start, max_months, trigger_after = parse_monthly_backfill_request(request)
+        client = bigquery.Client(project=Config.PROJECT_ID)
+        ensure_daily_weight_table(client)
+
+        report_min_date = fallback_start or fetch_report_min_date(client)
+        results = []
+        cached_first_month = None
+        last_processed_month = None
+
+        for month_start in iter_months(monthly_start, monthly_end, max_months):
+            month_end = min(last_day_of_month(month_start), monthly_end)
+            user_paths, raw_rows = load_source_data_for_window(client, month_start, month_end)
+            df_weights = markov_attribution(user_paths)
+            weight_dates = list(iter_date_range(month_start, month_end))
+            merge_weights_for_dates(client, df_weights, weight_dates, month_start, month_end)
+
+            if month_start == first_day_of_month(monthly_start):
+                cached_first_month = (df_weights, month_start, month_end)
+
+            last_processed_month = month_start
+            results.append(
+                {
+                    "monthStart": month_start.isoformat(),
+                    "monthEnd": month_end.isoformat(),
+                    "rawRows": raw_rows,
+                    "paths": len(user_paths),
+                    "channels": len(df_weights),
+                    "datesWritten": len(weight_dates),
+                    "weightSum": float(df_weights["Weight"].sum()),
+                }
+            )
+
+        next_month_start = None
+        complete = True
+        if last_processed_month and add_month(last_processed_month) <= first_day_of_month(monthly_end):
+            next_month_start = add_month(last_processed_month).isoformat()
+            complete = False
+
+        fallback_result = None
+        if report_min_date < monthly_start and cached_first_month is not None:
+            df_weights, source_start, source_end = cached_first_month
+            fallback_end = monthly_start - timedelta(days=1)
+            fallback_dates = list(iter_date_range(report_min_date, fallback_end))
+            merge_weights_for_dates(client, df_weights, fallback_dates, source_start, source_end)
+            fallback_result = {
+                "fallbackStart": report_min_date.isoformat(),
+                "fallbackEnd": fallback_end.isoformat(),
+                "sourceMonthStart": source_start.isoformat(),
+                "sourceMonthEnd": source_end.isoformat(),
+                "datesWritten": len(fallback_dates),
+                "channels": len(df_weights),
+            }
+
+        dataform_result = {"success": False, "skipped": True}
+        if trigger_after and complete:
+            dataform_result = trigger_dataform_workflow()
+
+        return json.dumps(
+            {
+                "status": "success",
+                "monthlyStart": monthly_start.isoformat(),
+                "monthlyEnd": monthly_end.isoformat(),
+                "processedMonths": len(results),
+                "complete": complete,
+                "nextMonthlyStart": next_month_start,
+                "results": results,
+                "fallback": fallback_result,
+                "dataform": dataform_result,
+            }
+        ), 200
+    except Exception as exc:
+        logger.error("Monthly backfill failed: %s", exc)
         traceback.print_exc()
         return json.dumps({"status": "error", "message": str(exc)}), 500
