@@ -29,6 +29,11 @@ Daily_Markov_Weights AS (
     `bigquery-2024.attribution_v1.mta_markov_weights_daily`
   WHERE
     weight_date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1080 DAY)
+  QUALIFY
+    ROW_NUMBER() OVER (
+      PARTITION BY weight_date, channel
+      ORDER BY run_timestamp DESC, window_end_date DESC
+    ) = 1
 ),
 
 Performance_Stats AS (
