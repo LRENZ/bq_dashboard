@@ -27,7 +27,7 @@ Campaign_Base AS (
   FROM ${ref('channel_campaign_performance')}
   WHERE ${when(
     incremental(),
-      `date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 7 DAY)`,
+      `date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1080 DAY)`,
       `date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1080 DAY)`
   )}
 ),
@@ -51,7 +51,7 @@ Channel_MTA_Source AS (
   FROM ${ref('composite_attribution_performance')}
   WHERE ${when(
     incremental(),
-     `date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 7 DAY)`,
+     `date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1080 DAY)`,
      `date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1080 DAY)`
   )}
 ),

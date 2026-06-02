@@ -19,7 +19,7 @@ Current_Batch_Data AS (
   WHERE
     ${when(
       incremental(),
-      `date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 7 DAY)`,
+      `date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1080 DAY)`,
       `date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1080 DAY)`
     )}
 ),
