@@ -14,9 +14,9 @@ from google.cloud import dataform_v1beta1
 class Config:
     PROJECT_ID = os.environ.get("PROJECT_ID", "bigquery-2024")
     DEST_DATASET_ID = os.environ.get("DEST_DATASET_ID", "attribution_v1")
-    SOURCE_JOURNEY_TABLE = os.environ.get(
-        "SOURCE_JOURNEY_TABLE",
-        "bigquery-2024.attribution.session_source_medium",
+    SOURCE_EVENTS_TABLE = os.environ.get(
+        "SOURCE_EVENTS_TABLE",
+        "bigquery-2024.analytics_489554557.events_*",
     )
     DAILY_WEIGHT_TABLE = os.environ.get(
         "DAILY_WEIGHT_TABLE",
@@ -44,18 +44,332 @@ logger = logging.getLogger(__name__)
 
 
 ATTRIBUTION_QUERY = """
+WITH RawEvents AS (
+  SELECT
+    user_pseudo_id,
+    user_id,
+    event_timestamp,
+    event_name,
+    event_params,
+    session_traffic_source_last_click,
+    ecommerce,
+    (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS ga_session_id
+  FROM `{source_events_table}`
+  WHERE event_name IN ('purchase', 'session_start', 'first_visit', 'page_view')
+    AND _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', @window_start_date)
+                          AND FORMAT_DATE('%Y%m%d', @target_date)
+),
+
+Session_Windowed AS (
+  SELECT
+    user_pseudo_id,
+    user_id,
+    event_timestamp,
+    event_name,
+    ga_session_id,
+    ecommerce.transaction_id,
+    COALESCE(ecommerce.purchase_revenue_in_usd, 0) AS transaction_value,
+    FIRST_VALUE(
+      LOWER(COALESCE(
+        session_traffic_source_last_click.cross_channel_campaign.source,
+        (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'source')
+      )) IGNORE NULLS
+    ) OVER (
+      PARTITION BY user_pseudo_id, ga_session_id
+      ORDER BY event_timestamp
+      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS session_source,
+    FIRST_VALUE(
+      LOWER(COALESCE(
+        session_traffic_source_last_click.cross_channel_campaign.medium,
+        (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'medium')
+      )) IGNORE NULLS
+    ) OVER (
+      PARTITION BY user_pseudo_id, ga_session_id
+      ORDER BY event_timestamp
+      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS session_medium,
+    FIRST_VALUE(
+      LOWER(COALESCE(
+        session_traffic_source_last_click.cross_channel_campaign.campaign_name,
+        (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'campaign')
+      )) IGNORE NULLS
+    ) OVER (
+      PARTITION BY user_pseudo_id, ga_session_id
+      ORDER BY event_timestamp
+      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS session_campaign,
+    FIRST_VALUE(
+      session_traffic_source_last_click.cross_channel_campaign.default_channel_group IGNORE NULLS
+    ) OVER (
+      PARTITION BY user_pseudo_id, ga_session_id
+      ORDER BY event_timestamp
+      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS raw_channel_group,
+    FIRST_VALUE(
+      CASE
+        WHEN event_name IN ('page_view', 'session_start')
+        THEN LOWER((SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location'))
+      END IGNORE NULLS
+    ) OVER (
+      PARTITION BY user_pseudo_id, ga_session_id
+      ORDER BY event_timestamp
+      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS landing_page
+  FROM RawEvents
+),
+
+SessionEvents AS (
+  SELECT
+    COALESCE(
+      LAST_VALUE(user_id IGNORE NULLS) OVER (
+        PARTITION BY user_pseudo_id
+        ORDER BY event_timestamp
+        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+      ),
+      user_pseudo_id
+    ) AS unified_user_id,
+    event_timestamp,
+    event_name,
+    COALESCE(raw_channel_group, 'Unassigned') AS default_channel_group,
+    COALESCE(session_source, '(direct)') AS source,
+    COALESCE(session_medium, '(none)') AS medium,
+    COALESCE(session_campaign, '(not set)') AS campaign,
+    landing_page,
+    transaction_id,
+    transaction_value
+  FROM Session_Windowed
+),
+
+EventsWithFlags AS (
+  SELECT
+    *,
+    CASE
+      WHEN REGEXP_CONTAINS(default_channel_group, r'Paid') THEN TRUE
+      WHEN default_channel_group = 'Display' THEN TRUE
+      WHEN REGEXP_CONTAINS(medium, r'^(cpc|ppc|display|cpm|banner)$') THEN TRUE
+      WHEN medium LIKE '%paid%' THEN TRUE
+      ELSE FALSE
+    END AS is_initial_paid_flag
+  FROM SessionEvents
+),
+
+BaseTouchpoints AS (
+  SELECT
+    unified_user_id,
+    event_timestamp,
+    event_name,
+    source,
+    medium,
+    campaign,
+    landing_page,
+    transaction_id,
+    transaction_value,
+    is_initial_paid_flag,
+    CASE
+      WHEN is_initial_paid_flag
+           AND REGEXP_CONTAINS(landing_page, r'/pages/(what-is-an-ebike|cruiser-ebike|folding-ebike|city-ebike|fat-tire-ebike)')
+        THEN 'pillar page'
+      WHEN default_channel_group = 'Affiliates'
+        OR REGEXP_CONTAINS(medium, r'affiliate|avantlink|uppromote|goaffpro|impact')
+        OR REGEXP_CONTAINS(source, r'affiliate|avantlink|uppromote|goaffpro|impact')
+        THEN 'affiliates'
+      WHEN default_channel_group = 'SMS' OR REGEXP_CONTAINS(medium, r'sms') THEN 'sms'
+      WHEN default_channel_group = 'Email'
+        OR REGEXP_CONTAINS(source, r'klaviyo|email|substack|wunderkind')
+        OR medium = 'edm'
+        THEN 'email'
+      WHEN REGEXP_CONTAINS(medium, r'kol') OR source = 'kol' THEN 'kol'
+      WHEN medium = 'programmatic'
+        OR REGEXP_CONTAINS(source, r'ttd|outbrain|loopme|criteo|tradedesk')
+        THEN 'programmatic ads'
+      WHEN (default_channel_group = 'Paid Search' OR medium IN ('cpc', 'ppc', 'paidsearch'))
+        AND REGEXP_CONTAINS(campaign, r'brand')
+        THEN 'paid brand search'
+      WHEN default_channel_group = 'Paid Search'
+        AND NOT REGEXP_CONTAINS(campaign, r'brand')
+        THEN 'paid non-brand search'
+      WHEN default_channel_group = 'Organic Search' THEN 'organic search'
+      WHEN (
+          default_channel_group = 'Paid Social'
+          OR REGEXP_CONTAINS(source, r'facebook|twitter|youtube|instagram|reddit|fb|quora')
+          OR medium = 'paidsocial'
+        )
+        AND medium != 'referral'
+        THEN 'paid social'
+      WHEN default_channel_group = 'Organic Social' THEN 'organic social'
+      WHEN default_channel_group = 'Paid Video' OR medium = 'paidvideo' THEN 'paid video'
+      WHEN default_channel_group = 'Organic Video' THEN 'organic video'
+      WHEN default_channel_group = 'Paid Shopping' THEN 'paid shopping'
+      WHEN default_channel_group = 'Organic Shopping' THEN 'organic shopping'
+      WHEN default_channel_group = 'Display' OR medium = 'paiddisplay' THEN 'paid display'
+      WHEN default_channel_group = 'Cross-network' THEN 'cross-network'
+      WHEN default_channel_group = 'Audio' THEN 'audio'
+      WHEN default_channel_group = 'Mobile Push Notifications' OR REGEXP_CONTAINS(medium, r'push') THEN 'mobile push notifications'
+      WHEN default_channel_group = 'Paid Other' THEN 'paid other'
+      WHEN REGEXP_CONTAINS(medium, r'ads|pr|paidreferral') THEN 'paid referral'
+      WHEN default_channel_group = 'Referral'
+        OR REGEXP_CONTAINS(source, r'chatgpt')
+        OR REGEXP_CONTAINS(medium, r'earnedreferral')
+        THEN 'organic referral'
+      WHEN default_channel_group = 'Direct'
+        OR source = '(direct)'
+        OR medium IN ('(none)', 'none')
+        THEN 'direct'
+      WHEN REGEXP_CONTAINS(medium, r'tv|television|connectedtv')
+        OR REGEXP_CONTAINS(source, r'mntn')
+        THEN 'connected tv'
+      ELSE 'unassigned'
+    END AS base_channel
+  FROM EventsWithFlags
+),
+
+AllTouchpoints AS (
+  SELECT
+    unified_user_id,
+    event_timestamp,
+    event_name,
+    source,
+    medium,
+    campaign,
+    transaction_id,
+    transaction_value,
+    CASE
+      WHEN base_channel = 'affiliates' THEN FALSE
+      WHEN REGEXP_CONTAINS(base_channel, r'^paid') THEN TRUE
+      WHEN base_channel IN ('programmatic ads', 'connected tv', 'display', 'cross-network') THEN TRUE
+      WHEN is_initial_paid_flag THEN TRUE
+      ELSE FALSE
+    END AS is_paid_traffic,
+    CASE
+      WHEN base_channel IN ('pillar page', 'email', 'sms', 'affiliates', 'unassigned', 'kol') THEN base_channel
+      WHEN is_initial_paid_flag
+           OR REGEXP_CONTAINS(base_channel, r'^paid')
+           OR base_channel IN ('programmatic ads', 'connected tv', 'display', 'cross-network')
+      THEN
+        CASE
+          WHEN CONTAINS_SUBSTR(campaign, '-aw') THEN base_channel || ':branding'
+          WHEN CONTAINS_SUBSTR(campaign, '-cs') THEN base_channel || ':traffic'
+          WHEN CONTAINS_SUBSTR(campaign, '-cv') THEN base_channel || ':conversion'
+          WHEN CONTAINS_SUBSTR(campaign, '-rt') THEN base_channel || ':retargeting'
+          ELSE base_channel || ':conversion'
+        END
+      ELSE base_channel
+    END AS channel
+  FROM BaseTouchpoints
+),
+
+PurchaseEvents AS (
+  SELECT
+    unified_user_id,
+    transaction_id,
+    event_timestamp AS purchase_timestamp,
+    transaction_value,
+    DATE(TIMESTAMP_MICROS(event_timestamp), "America/Los_Angeles") AS purchase_date,
+    LAG(event_timestamp, 1, 0) OVER (
+      PARTITION BY unified_user_id
+      ORDER BY event_timestamp
+    ) AS previous_purchase_timestamp
+  FROM AllTouchpoints
+  WHERE transaction_id IS NOT NULL
+    AND DATE(TIMESTAMP_MICROS(event_timestamp), "America/Los_Angeles")
+      BETWEEN @window_start_date AND @target_date
+),
+
+TransactionJourneys AS (
+  SELECT
+    p.unified_user_id,
+    p.transaction_id,
+    p.purchase_date,
+    p.transaction_value,
+    ARRAY_AGG(
+      STRUCT(
+        t.channel,
+        t.event_name,
+        t.event_timestamp,
+        t.is_paid_traffic,
+        t.source,
+        t.medium,
+        t.campaign
+      )
+      ORDER BY t.event_timestamp
+    ) AS touchpoint_path
+  FROM PurchaseEvents p
+  JOIN AllTouchpoints t
+    ON p.unified_user_id = t.unified_user_id
+  WHERE t.event_timestamp > p.previous_purchase_timestamp
+    AND t.event_timestamp <= p.purchase_timestamp
+  GROUP BY 1, 2, 3, 4
+),
+
+ExpandedPath AS (
+  SELECT
+    t.unified_user_id,
+    t.purchase_date,
+    t.transaction_id,
+    TIMESTAMP_MICROS(touchpoint.event_timestamp) AS event_date,
+    touchpoint.event_name,
+    touchpoint.channel,
+    touchpoint.is_paid_traffic,
+    touchpoint.source,
+    touchpoint.medium,
+    touchpoint.campaign,
+    t.transaction_value
+  FROM TransactionJourneys t
+  CROSS JOIN UNNEST(t.touchpoint_path) AS touchpoint
+),
+
+PathWithTransactions AS (
+  SELECT
+    unified_user_id,
+    purchase_date,
+    transaction_id,
+    event_date,
+    channel,
+    is_paid_traffic,
+    source,
+    medium,
+    campaign,
+    CASE WHEN event_name = 'purchase' THEN 1 ELSE 0 END AS total_transactions,
+    CASE WHEN event_name = 'purchase' THEN transaction_value ELSE 0 END AS total_transaction_value,
+    CASE WHEN event_name = 'purchase' THEN TRUE ELSE FALSE END AS has_transaction,
+    LAG(channel) OVER (
+      PARTITION BY unified_user_id, transaction_id
+      ORDER BY event_date
+    ) AS prev_channel,
+    event_name
+  FROM ExpandedPath
+),
+
+FinalOutput AS (
+  SELECT
+    unified_user_id,
+    transaction_id,
+    event_date,
+    channel,
+    total_transactions,
+    total_transaction_value,
+    has_transaction
+  FROM PathWithTransactions
+  WHERE prev_channel IS NULL
+    OR channel != prev_channel
+    OR event_name = 'purchase'
+)
+
 SELECT
   unified_user_id,
   transaction_id,
   event_date,
   channel,
-  total_transactions,
-  total_transaction_value,
-  has_transaction
-FROM `{source_journey_table}`
-WHERE purchase_date BETWEEN @window_start_date AND @target_date
-  AND transaction_id IS NOT NULL
-  AND channel IS NOT NULL
+  SUM(total_transactions) AS total_transactions,
+  SUM(total_transaction_value) AS total_transaction_value,
+  MAX(has_transaction) AS has_transaction
+FROM FinalOutput
+GROUP BY
+  unified_user_id,
+  transaction_id,
+  event_date,
+  channel
 ORDER BY unified_user_id, transaction_id, event_date
 """
 
@@ -226,7 +540,7 @@ def load_source_data(client, target_date):
             bigquery.ScalarQueryParameter("target_date", "DATE", target_date.isoformat()),
         ]
     )
-    query = ATTRIBUTION_QUERY.format(source_journey_table=Config.SOURCE_JOURNEY_TABLE)
+    query = ATTRIBUTION_QUERY.format(source_events_table=Config.SOURCE_EVENTS_TABLE)
     df_raw = client.query(query, job_config=job_config, location=Config.BQ_LOCATION).result().to_dataframe()
     return window_start_date, df_raw
 
@@ -333,4 +647,3 @@ def attribution_analysis(request):
         logger.error("Execution failed: %s", exc)
         traceback.print_exc()
         return json.dumps({"status": "error", "message": str(exc)}), 500
-
