@@ -26,8 +26,8 @@ This table changed schema and partitioning. Run only this Dataform action first.
 From a machine with Node.js and BigQuery credentials:
 
 ```bash
-npm install @google-cloud/bigquery
-node scripts/markov_backfill.js --start=2026-01-01 --end=2026-06-01 --keyfile="C:/Users/HP/Downloads/bigquery-2024-d889a9800188.json"
+pip install -r cloud-function/markov-python/requirements.txt
+python scripts/markov_backfill_python.py --start=2026-01-01 --end=2026-06-01 --keyfile="C:/Users/HP/Downloads/bigquery-2024-d889a9800188.json"
 ```
 
 Adjust `--end` to the last date you want to backfill.
@@ -57,4 +57,3 @@ The first two validation queries should return zero rows. The third query is dia
 ## Important Guardrail
 
 Do not use `attribution_v1.mta_attribution_v1_markov_details` as the reporting weight source. That table is loaded with `WRITE_TRUNCATE` and only represents the latest run.
-
