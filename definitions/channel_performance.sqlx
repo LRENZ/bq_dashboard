@@ -4,6 +4,7 @@ config {
   name: "channel_performance",
   description: "Daily channel performance with fixed session attribution inheritance (Pillar Page fix)",
   uniqueKey: ["date", "channel"],
+  protected: true,
   bigquery: {
     partitionBy: "date",
     clusterBy: ["channel"],

@@ -2,46 +2,54 @@ config {
   type: "table",
   schema: "attribution_v1",
   name: "mta_weights_complete",
-  description: "Complete MTA weights covering ALL channels",
+  description: "Complete daily MTA weights covering all reporting channels by weight_date",
   tags: ["attribution", "mta", "complete"]
 }
 
-WITH Latest_Markov_Weights AS (
+WITH Report_Date_Channels AS (
   SELECT
-    channel,
-    Weight AS markov_weight,
-    Removal_Effect AS removal_effect,
-    DATE(run_timestamp) AS run_date,
-    run_timestamp
+    date AS weight_date,
+    channel
   FROM
-    `bigquery-2024.attribution_v1.mta_attribution_v1_markov_details`
+    `bigquery-2024.attribution.channel_performance`
   WHERE
-    run_timestamp = (
-      SELECT MAX(run_timestamp) 
-      FROM `bigquery-2024.attribution_v1.mta_attribution_v1_markov_details`
-    )
+    date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1080 DAY)
 ),
 
-All_Unique_Channels AS (
-  SELECT DISTINCT channel FROM `bigquery-2024.attribution.session_source_medium`
-  UNION DISTINCT
-  SELECT DISTINCT channel FROM `bigquery-2024.attribution.channel_performance`
+Daily_Markov_Weights AS (
+  SELECT
+    weight_date,
+    channel,
+    weight AS markov_weight,
+    removal_effect,
+    window_start_date,
+    window_end_date,
+    run_timestamp
+  FROM
+    `bigquery-2024.attribution_v1.mta_markov_weights_daily`
+  WHERE
+    weight_date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1080 DAY)
 ),
 
 Journey_Stats AS (
   SELECT
+    purchase_date AS weight_date,
     channel,
     COUNT(DISTINCT unified_user_id) AS journey_users,
     SUM(total_transactions) AS journey_conversions,
     SUM(total_transaction_value) AS journey_revenue
   FROM
     `bigquery-2024.attribution.session_source_medium`
+  WHERE
+    purchase_date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1080 DAY)
   GROUP BY
+    weight_date,
     channel
 ),
 
 Performance_Stats AS (
   SELECT
+    date AS weight_date,
     channel,
     SUM(conversion) AS performance_conversions,
     SUM(revenue) AS performance_revenue,
@@ -49,30 +57,21 @@ Performance_Stats AS (
     SUM(users) AS performance_users
   FROM
     `bigquery-2024.attribution.channel_performance`
+  WHERE
+    date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1080 DAY)
   GROUP BY
+    weight_date,
     channel
 ),
 
--- Overall_Stats AS (
---   SELECT
---     COALESCE(SUM(js.journey_conversions), 0) AS total_journey_conversions,
---     COALESCE(SUM(js.journey_revenue), 0) AS total_journey_revenue,
---     COALESCE(SUM(ps.performance_conversions), 0) AS total_performance_conversions,
---     COALESCE(SUM(ps.performance_revenue), 0) AS total_performance_revenue
---   FROM
---     All_Unique_Channels auc
---   LEFT JOIN Journey_Stats js ON auc.channel = js.channel
---   LEFT JOIN Performance_Stats ps ON auc.channel = ps.channel
--- ),
-
 Combined_Data AS (
   SELECT
-    auc.channel,
-    -- 如果 markov 表里没有这个 channel，这里就是 0
+    rdc.weight_date,
+    rdc.channel,
     COALESCE(mw.markov_weight, 0) AS markov_weight,
     COALESCE(mw.removal_effect, 0) AS removal_effect,
-    
-    -- 仅作为参考数据展示，不参与权重计算
+    mw.window_start_date,
+    mw.window_end_date,
     COALESCE(js.journey_conversions, 0) AS journey_conversions,
     COALESCE(js.journey_revenue, 0) AS journey_revenue,
     COALESCE(js.journey_users, 0) AS journey_users,
@@ -80,58 +79,29 @@ Combined_Data AS (
     COALESCE(ps.performance_revenue, 0) AS performance_revenue,
     COALESCE(ps.performance_sessions, 0) AS performance_sessions,
     COALESCE(ps.performance_users, 0) AS performance_users,
-    
-    mw.run_date,
     mw.run_timestamp
   FROM
-    All_Unique_Channels auc
-  LEFT JOIN Latest_Markov_Weights mw ON auc.channel = mw.channel
-  LEFT JOIN Journey_Stats js ON auc.channel = js.channel
-  LEFT JOIN Performance_Stats ps ON auc.channel = ps.channel
+    Report_Date_Channels rdc
+  LEFT JOIN Daily_Markov_Weights mw
+    ON rdc.weight_date = mw.weight_date
+    AND rdc.channel = mw.channel
+  LEFT JOIN Journey_Stats js
+    ON rdc.weight_date = js.weight_date
+    AND rdc.channel = js.channel
+  LEFT JOIN Performance_Stats ps
+    ON rdc.weight_date = ps.weight_date
+    AND rdc.channel = ps.channel
 ),
-
-
--- Calculated_Weights AS (
---   SELECT
---     channel,
---     markov_weight,
---     removal_effect,
---     channel_category,
---     journey_conversions,
---     journey_revenue,
---     journey_users,
---     performance_conversions,
---     performance_revenue,
---     performance_sessions,
---     performance_users,
-    
---     SAFE_DIVIDE(journey_conversions, NULLIF(total_journey_conversions, 0)) AS journey_conv_share,
---     SAFE_DIVIDE(journey_revenue, NULLIF(total_journey_revenue, 0)) AS journey_rev_share,
---     SAFE_DIVIDE(performance_conversions, NULLIF(total_performance_conversions, 0)) AS perf_conv_share,
---     SAFE_DIVIDE(performance_revenue, NULLIF(total_performance_revenue, 0)) AS perf_rev_share,
-    
---     -- 计算兜底权重 (如果各项指标都是0，这里算出来就是0)
---     COALESCE(SAFE_DIVIDE(journey_conversions, NULLIF(total_journey_conversions, 0)), 0) * 0.25 +
---     COALESCE(SAFE_DIVIDE(journey_revenue, NULLIF(total_journey_revenue, 0)), 0) * 0.20 +
---     COALESCE(SAFE_DIVIDE(performance_conversions, NULLIF(total_performance_conversions, 0)), 0) * 0.30 +
---     COALESCE(SAFE_DIVIDE(performance_revenue, NULLIF(total_performance_revenue, 0)), 0) * 0.25
---     AS fallback_weight,
-    
---     run_date,
---     run_timestamp
---   FROM
---     Combined_Data
--- ),
 
 Final_Weights AS (
   SELECT
+    weight_date,
     channel,
     markov_weight AS original_markov_weight,
     removal_effect,
-    
-    -- [关键修改] 直接使用 markov_weight，如果是 0 或 NULL，结果就是 0
+    window_start_date,
+    window_end_date,
     COALESCE(markov_weight, 0) AS raw_weight,
-    
     journey_conversions,
     journey_revenue,
     journey_users,
@@ -139,40 +109,34 @@ Final_Weights AS (
     performance_revenue,
     performance_sessions,
     performance_users,
-    run_date,
     run_timestamp
   FROM
     Combined_Data
 ),
 
-
 Normalized_Weights AS (
   SELECT
+    weight_date,
     channel,
     original_markov_weight,
     removal_effect,
-    -- 在 SQL 里对 removal_effect 进行归一化
-    CASE 
-      WHEN SUM(removal_effect) OVER () > 0 
-      THEN SAFE_DIVIDE(removal_effect, SUM(removal_effect) OVER ())
-      ELSE 0 
+    window_start_date,
+    window_end_date,
+    CASE
+      WHEN SUM(removal_effect) OVER (PARTITION BY weight_date) > 0
+      THEN SAFE_DIVIDE(removal_effect, SUM(removal_effect) OVER (PARTITION BY weight_date))
+      ELSE 0
     END AS normalized_removal_effect,
-
     raw_weight,
-    
-    -- 归一化：为了保险起见，将所有 markov 权重重新缩放为 1
-    -- 如果原模型输出本身就是 1，这里的计算结果不会变
-    CASE 
-      WHEN SUM(raw_weight) OVER () > 0 THEN SAFE_DIVIDE(raw_weight, SUM(raw_weight) OVER ())
-      ELSE 0 
+    CASE
+      WHEN SUM(raw_weight) OVER (PARTITION BY weight_date) > 0
+      THEN SAFE_DIVIDE(raw_weight, SUM(raw_weight) OVER (PARTITION BY weight_date))
+      ELSE 0
     END AS normalized_weight,
-    
-    -- 简化 Source 标记
     CASE
       WHEN raw_weight > 0 THEN 'Markov Chain'
       ELSE 'No Markov Weight (Zero)'
     END AS weight_source,
-    
     journey_conversions,
     journey_revenue,
     journey_users,
@@ -180,18 +144,20 @@ Normalized_Weights AS (
     performance_revenue,
     performance_sessions,
     performance_users,
-    run_date,
     run_timestamp
   FROM
     Final_Weights
 )
 
 SELECT
+  weight_date AS Weight_Date,
   channel,
   normalized_weight AS Weight,
   original_markov_weight AS Original_Markov_Weight,
   normalized_removal_effect AS Removal_Effect,
   weight_source AS Weight_Source,
+  window_start_date AS Window_Start_Date,
+  window_end_date AS Window_End_Date,
   journey_conversions AS Journey_Conversions,
   journey_revenue AS Journey_Revenue,
   performance_conversions AS Performance_Conversions,
@@ -199,10 +165,10 @@ SELECT
   journey_users AS Journey_Users,
   performance_users AS Performance_Users,
   performance_sessions AS Performance_Sessions,
-  run_date AS Markov_Run_Date,
   run_timestamp AS Markov_Run_Timestamp,
   CURRENT_TIMESTAMP() AS Created_Timestamp
 FROM
   Normalized_Weights
 ORDER BY
+  Weight_Date DESC,
   normalized_weight DESC

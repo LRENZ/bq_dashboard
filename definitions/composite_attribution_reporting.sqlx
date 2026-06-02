@@ -4,6 +4,7 @@ config {
   name: "composite_attribution_reporting",
   description: "Reporting table with YoY and MoM, runs incrementally",
   uniqueKey: ["date", "channel"],
+  protected: true,
   bigquery: {
     partitionBy: "date",
     clusterBy: ["channel"]

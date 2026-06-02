@@ -1,0 +1,13 @@
+{
+  "name": "markov-daily",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "@google-cloud/bigquery": "^8.1.1",
+    "@google-cloud/functions-framework": "^3.5.1"
+  },
+  "scripts": {
+    "start": "functions-framework --target=runDailyMarkov"
+  }
+}
+

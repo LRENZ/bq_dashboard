@@ -4,6 +4,7 @@ config {
   name: "composite_attribution_performance",
   description: "Composite attribution - GUARANTEED daily totals match",
   uniqueKey: ["date", "channel"],
+  protected: true,
   bigquery: {
     partitionBy: "date",
     clusterBy: ["channel"]
@@ -54,6 +55,7 @@ Daily_Totals AS (
 -- 3. 获取 MTA 权重 (已移除 Fallback Weight)
 MTA_Weights AS (
   SELECT
+    Weight_Date AS weight_date,
     channel,
     Weight AS mta_weight,
     Original_Markov_Weight AS original_markov_weight,
@@ -84,7 +86,8 @@ Channel_With_Weights AS (
     Raw_Performance rp
   LEFT JOIN
     MTA_Weights mw
-    ON rp.channel = mw.channel
+    ON rp.date = mw.weight_date
+    AND rp.channel = mw.channel
 ),
 
 -- 5. 计算每日权重总和

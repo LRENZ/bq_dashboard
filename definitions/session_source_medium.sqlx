@@ -1,8 +1,14 @@
 config {
-  type: "table",
+  type: "incremental",
   schema: "attribution",
   name: "session_source_medium",
-  description: "User journey data with fixed session-scoped attribution touchpoints"
+  description: "User journey data with fixed session-scoped attribution touchpoints",
+  uniqueKey: ["purchase_date", "transaction_id", "unified_user_id", "event_date", "channel", "source", "medium", "campaign"],
+  bigquery: {
+    partitionBy: "purchase_date",
+    clusterBy: ["channel", "transaction_id"],
+    updatePartitionFilter: "purchase_date >= DATE_SUB(CURRENT_DATE('America/Los_Angeles'), INTERVAL 37 DAY)"
+  }
 }
 
 WITH RawEvents AS (
@@ -20,8 +26,13 @@ WITH RawEvents AS (
     `bigquery-2024.analytics_489554557.events_*`
   WHERE
     event_name IN ('purchase', 'session_start', 'first_visit', 'page_view')
-    AND _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY))
-                           AND FORMAT_DATE('%Y%m%d', CURRENT_DATE())
+    AND ${when(
+      incremental(),
+      `_TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 37 DAY))
+                         AND FORMAT_DATE('%Y%m%d', CURRENT_DATE("America/Los_Angeles"))`,
+      `_TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1080 DAY))
+                         AND FORMAT_DATE('%Y%m%d', CURRENT_DATE("America/Los_Angeles"))`
+    )}
 ),
 
 Session_Windowed AS (
@@ -318,8 +329,11 @@ PurchaseEvents AS (
     AllTouchpoints
   WHERE
     transaction_id IS NOT NULL
-    AND DATE(TIMESTAMP_MICROS(event_timestamp), "America/Los_Angeles") >= 
-        DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 30 DAY)
+    AND ${when(
+      incremental(),
+      `DATE(TIMESTAMP_MICROS(event_timestamp), "America/Los_Angeles") >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 7 DAY)`,
+      `DATE(TIMESTAMP_MICROS(event_timestamp), "America/Los_Angeles") >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1080 DAY)`
+    )}
 ),
 
 TransactionJourneys AS (
@@ -427,6 +441,8 @@ SELECT
     WHEN REGEXP_CONTAINS(CAST(unified_user_id AS STRING), r'^\d+\.\d+$') THEN 'cookie_id'
     ELSE 'user_id'
   END AS user_id_type,
+  purchase_date,
+  transaction_id,
   event_date,
   channel,
   is_paid_traffic,
@@ -443,6 +459,8 @@ FROM
 GROUP BY
   unified_user_id,
   user_id_type,
+  purchase_date,
+  transaction_id,
   event_date,
   channel,
   is_paid_traffic,

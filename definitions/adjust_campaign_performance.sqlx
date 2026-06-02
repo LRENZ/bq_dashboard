@@ -4,6 +4,7 @@ config {
   name: "composite_campaign_attribution_performance",
   description: "Campaign-level attribution metrics distributed from Channel totals based on Session share (calculated within campaign_performance), including all original weight metadata",
   uniqueKey: ["date", "channel", "campaign"],
+  protected: true,
   bigquery: {
     partitionBy: "date",
     clusterBy: ["channel", "campaign"]

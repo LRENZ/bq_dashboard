@@ -16,6 +16,12 @@ declare({
   name: 'mta_attribution_v1_markov_details',
 });
 
+declare({
+  database: 'bigquery-2024',
+  schema: 'attribution_v1',
+  name: 'mta_markov_weights_daily',
+});
+
 
 /*
 declare({
