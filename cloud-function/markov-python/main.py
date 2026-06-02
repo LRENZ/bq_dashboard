@@ -28,9 +28,9 @@ class Config:
     )
     BQ_LOCATION = os.environ.get("BQ_LOCATION", "US")
 
-    # Dataform should usually run session_source_medium before this function,
-    # then downstream attribution tables after this function.
-    TRIGGER_DATAFORM_AFTER = os.environ.get("TRIGGER_DATAFORM_AFTER", "false").lower() == "true"
+    # The function writes the daily Markov weights first, then triggers Dataform.
+    # Set TRIGGER_DATAFORM_AFTER=false only when running manual backfills.
+    TRIGGER_DATAFORM_AFTER = os.environ.get("TRIGGER_DATAFORM_AFTER", "true").lower() == "true"
     DATAFORM_REGION = os.environ.get("DATAFORM_REGION", "us-central1")
     DATAFORM_REPOSITORY_ID = os.environ.get("DATAFORM_REPOSITORY_ID", "bq")
     DATAFORM_WORKFLOW_CONFIG_ID = os.environ.get("DATAFORM_WORKFLOW_CONFIG_ID", "ga4_attribution")

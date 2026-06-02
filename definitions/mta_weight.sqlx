@@ -31,22 +31,6 @@ Daily_Markov_Weights AS (
     weight_date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1080 DAY)
 ),
 
-Journey_Stats AS (
-  SELECT
-    purchase_date AS weight_date,
-    channel,
-    COUNT(DISTINCT unified_user_id) AS journey_users,
-    SUM(total_transactions) AS journey_conversions,
-    SUM(total_transaction_value) AS journey_revenue
-  FROM
-    `bigquery-2024.attribution.session_source_medium`
-  WHERE
-    purchase_date >= DATE_SUB(CURRENT_DATE("America/Los_Angeles"), INTERVAL 1080 DAY)
-  GROUP BY
-    weight_date,
-    channel
-),
-
 Performance_Stats AS (
   SELECT
     date AS weight_date,
@@ -72,9 +56,9 @@ Combined_Data AS (
     COALESCE(mw.removal_effect, 0) AS removal_effect,
     mw.window_start_date,
     mw.window_end_date,
-    COALESCE(js.journey_conversions, 0) AS journey_conversions,
-    COALESCE(js.journey_revenue, 0) AS journey_revenue,
-    COALESCE(js.journey_users, 0) AS journey_users,
+    0 AS journey_conversions,
+    0 AS journey_revenue,
+    0 AS journey_users,
     COALESCE(ps.performance_conversions, 0) AS performance_conversions,
     COALESCE(ps.performance_revenue, 0) AS performance_revenue,
     COALESCE(ps.performance_sessions, 0) AS performance_sessions,
@@ -85,9 +69,6 @@ Combined_Data AS (
   LEFT JOIN Daily_Markov_Weights mw
     ON rdc.weight_date = mw.weight_date
     AND rdc.channel = mw.channel
-  LEFT JOIN Journey_Stats js
-    ON rdc.weight_date = js.weight_date
-    AND rdc.channel = js.channel
   LEFT JOIN Performance_Stats ps
     ON rdc.weight_date = ps.weight_date
     AND rdc.channel = ps.channel
