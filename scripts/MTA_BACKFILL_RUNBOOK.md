@@ -47,6 +47,24 @@ Adjust `--end` to the last date you want to backfill.
 
 The first two validation queries should return zero rows. The third query is diagnostic: high `distinct_original_weights` means historical months are no longer using one frozen global weight.
 
+## Cloud Function Backfill Option
+
+If you do not want to run the local script, deploy `cloud-function/markov-backfill-python` with entry point `backfill_markov`.
+
+Run it in batches:
+
+```text
+?startDate=2026-01-01&endDate=2026-06-01&maxDays=7
+```
+
+Use the returned `nextStartDate` for the next request. On the final request, you can add:
+
+```text
+&triggerDataformAfter=true
+```
+
+For long ranges, local execution is safer than one Cloud Function request because Cloud Functions have request timeout limits.
+
 ## Daily Forward Flow
 
 1. Dataform refreshes `session_source_medium` for recent purchase dates.

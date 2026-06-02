@@ -29,9 +29,10 @@ class Config:
     )
     BQ_LOCATION = os.environ.get("BQ_LOCATION", "US")
 
-    # The function writes the daily Markov weights first, then triggers Dataform.
-    # Set TRIGGER_DATAFORM_AFTER=false only when running manual backfills.
-    TRIGGER_DATAFORM_AFTER = os.environ.get("TRIGGER_DATAFORM_AFTER", "true").lower() == "true"
+    # Backfills should not trigger Dataform after every single date.
+    # Pass triggerDataformAfter=true in the final request to trigger once.
+    TRIGGER_DATAFORM_AFTER = os.environ.get("TRIGGER_DATAFORM_AFTER", "false").lower() == "true"
+    BACKFILL_MAX_DAYS = int(os.environ.get("BACKFILL_MAX_DAYS", "7"))
     DATAFORM_REGION = os.environ.get("DATAFORM_REGION", "us-central1")
     DATAFORM_REPOSITORY_ID = os.environ.get("DATAFORM_REPOSITORY_ID", "bq")
     DATAFORM_WORKFLOW_CONFIG_ID = os.environ.get("DATAFORM_WORKFLOW_CONFIG_ID", "ga4_attribution")
@@ -653,5 +654,91 @@ def attribution_analysis(request):
         return json.dumps(result), 200
     except Exception as exc:
         logger.error("Execution failed: %s", exc)
+        traceback.print_exc()
+        return json.dumps({"status": "error", "message": str(exc)}), 500
+
+
+def parse_backfill_request(request):
+    if hasattr(request, "get_json"):
+        payload = request.get_json(silent=True) or {}
+        args = request.args or {}
+        start = args.get("startDate") or payload.get("startDate")
+        end = args.get("endDate") or payload.get("endDate")
+        max_days = args.get("maxDays") or payload.get("maxDays")
+        trigger_after = args.get("triggerDataformAfter") or payload.get("triggerDataformAfter")
+    elif isinstance(request, dict):
+        start = request.get("startDate")
+        end = request.get("endDate")
+        max_days = request.get("maxDays")
+        trigger_after = request.get("triggerDataformAfter")
+    else:
+        start = end = max_days = trigger_after = None
+
+    if not start or not end:
+        raise ValueError("startDate and endDate are required, format YYYY-MM-DD")
+
+    max_days_value = Config.BACKFILL_MAX_DAYS if max_days is None else int(max_days)
+    trigger_after_value = str(trigger_after).lower() == "true"
+    return (
+        datetime.strptime(start, "%Y-%m-%d").date(),
+        datetime.strptime(end, "%Y-%m-%d").date(),
+        max_days_value,
+        trigger_after_value,
+    )
+
+
+def iter_dates(start_date, end_date, max_days):
+    current = start_date
+    processed = 0
+    while current <= end_date and (max_days <= 0 or processed < max_days):
+        yield current
+        current += timedelta(days=1)
+        processed += 1
+
+
+def backfill_markov(request):
+    try:
+        start_date, end_date, max_days, trigger_after = parse_backfill_request(request)
+        results = []
+        last_processed = None
+
+        original_trigger = Config.TRIGGER_DATAFORM_AFTER
+        Config.TRIGGER_DATAFORM_AFTER = False
+        try:
+            for target_date in iter_dates(start_date, end_date, max_days):
+                result = run_attribution_analysis({"targetDate": target_date.isoformat()})
+                results.append(result)
+                last_processed = target_date
+        finally:
+            Config.TRIGGER_DATAFORM_AFTER = original_trigger
+
+        next_start_date = None
+        complete = True
+        if last_processed and last_processed < end_date:
+            next_start_date = (last_processed + timedelta(days=1)).isoformat()
+            complete = False
+
+        dataform_result = {"success": False, "skipped": True}
+        if trigger_after and complete:
+            Config.TRIGGER_DATAFORM_AFTER = True
+            try:
+                dataform_result = trigger_dataform_workflow()
+            finally:
+                Config.TRIGGER_DATAFORM_AFTER = original_trigger
+
+        return json.dumps(
+            {
+                "status": "success",
+                "startDate": start_date.isoformat(),
+                "endDate": end_date.isoformat(),
+                "processedDays": len(results),
+                "complete": complete,
+                "nextStartDate": next_start_date,
+                "results": results,
+                "dataform": dataform_result,
+            }
+        ), 200
+    except Exception as exc:
+        logger.error("Backfill failed: %s", exc)
         traceback.print_exc()
         return json.dumps({"status": "error", "message": str(exc)}), 500
